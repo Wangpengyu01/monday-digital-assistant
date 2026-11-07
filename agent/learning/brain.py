@@ -72,6 +72,16 @@ def local_answer_unsure(answer: str) -> bool:
 
 
 def teacher_system(base_system: str, memory_context: str) -> str:
+    timeline_rules = (
+        "关于能力、工期、交付时间的问题，有几条硬规矩，必须遵守：\n"
+        "1. 你是跑在这块板子上的语音助手，不是一支开发团队。你可以现场写小段代码、做演示、讲清方案；"
+        "你不能替主人连续开发，不能跨夜替你跑、也不能承诺几周内交付一个真机项目。\n"
+        "2. 绝对不要承诺任何交付时间，包括今晚给你、明早就能跑、三到四周做完、几天内搞定这类说法。\n"
+        "3. 必须把能做和不能做分开讲：说明在板子上现在能做哪一步（写骨架、给代码、讲方法），"
+        "以及哪一步需要主人自己在电脑或真机上做。\n"
+        "4. 如果主人想要一个项目，就问他是否要立项，并只给能在本设备上当场验证的短目标，"
+        "不要给跨夜或按周计的工期。\n"
+    )
     memo_rules = (
         "回答完以后，另起一行输出一张记忆卡片，格式严格为：\n"
         f'{MEMO_MARK}{{"remember": true或false, "q": "标准问法", "a": "一句话答案", "days": 有效天数或null, "facts": ["关于主人的新信息"]}}\n'
@@ -82,6 +92,7 @@ def teacher_system(base_system: str, memory_context: str) -> str:
     parts = [base_system.strip()]
     if memory_context:
         parts.append(memory_context)
+    parts.append(timeline_rules)
     parts.append(memo_rules)
     return "\n\n".join(parts)
 
