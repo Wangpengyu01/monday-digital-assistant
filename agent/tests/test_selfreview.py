@@ -27,6 +27,11 @@ Traceback (most recent call last):
   File "/userdata/agent/orchestrator/main.py", line 10, in x
 KeyError: 'q'
 17:52:00 INFO [tts] speak (1/1): 没等到你的确认，这一步我就不做了。
+18:18:20 INFO [tts] speak (1/1): 嗯，我想一想哈，
+18:18:21 INFO [intent] chat (teacher): 你的制造商是谁？
+18:18:35 INFO [tts] speak (1/1): 我是预训练出来的模型。
+18:19:18 INFO [intent] knowledge (teacher): 泰勒公式
+18:19:22 INFO [tts] speak (1/2): 泰勒公式就是……
 """
 
 
@@ -81,7 +86,10 @@ class SelfReviewTests(unittest.TestCase):
         self.assertIn("问主人要不要做，主人没来得及回答就取消了：1 次", body)
         self.assertIn("KeyError: 'q'", body)                                # the exception, not just "Traceback"
         self.assertIn("后 44 秒才开口", body)
-        self.assertNotIn("堪培拉", body)                                       # good turns are not evidence
+        every, flagged = body.split("明显出问题的地方")[0], body.split("明显出问题的地方")[1].split("日志信号")[0]
+        self.assertIn("堪培拉", every)                 # every turn is read: soft mistakes only show in good-looking ones
+        self.assertNotIn("堪培拉", flagged)
+        self.assertIn("「你的制造商是谁？」14 秒才说出答案", body)
 
     def test_a_problem_becomes_a_repair_project(self) -> None:
         t = Teacher([PROBLEM])

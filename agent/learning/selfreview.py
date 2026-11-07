@@ -33,7 +33,9 @@ STATE_FILE = "selfreview_state.json"
 LOG_FILE = "selfreview.jsonl"
 FIRST_LOOK_BYTES = 3 << 20     # no saved place yet (or the log was rotated): read the last 3 MB
 MAX_LOG_BYTES = 8 << 20
-EVIDENCE_CHARS = 9000
+EVIDENCE_CHARS = 12000
+TURNS_CHARS = 5000             # all turns since the last review (the newest when they do not all fit)
+SLOW_S = 12                    # an answer's first sentence later than this after the intent step is slow
 SILENCE_S = 15                 # a task's first sentence later than this is a silence the owner noticed
 REDO_DAYS = 3                  # a problem worked on in the last few days is not started again
 CODE_DIRS = ("orchestrator", "learning", "llm", "asr", "tts", "ops", "ui", "devices", "mcp_servers")
@@ -50,12 +52,17 @@ SIGNALS = (
     ("teacher_down", re.compile(r"\[agent\] teacher failed|teacher.*(?:timed out|HTTP 5\d\d)"), "老师联系不上"),
 )
 _TIME = re.compile(r"^(\d\d):(\d\d):(\d\d) ")
+_ASKED = re.compile(r"\[intent\] (?:knowledge|ask_teacher|chat) ")   # a question, answered by talking
 
 REVIEW_SYSTEM = (
     "你在帮语音助手「星期一」做自我检查：她跑在一块 RK3588 板子上，代码在 /userdata/agent。下面是她最近跟主人对话里"
     "出问题的地方和日志信号，还有她的代码文件清单和最近修过的问题。\n"
-    "找出最影响主人体验、能靠改她自己的代码修好的问题，按严重程度排，最多 3 个。主人亲身感受到的（答非所问、"
-    "办不成事、反复问主人、不出声、同一个问题被问好几次）优先，纯日志噪音靠后。\n"
+    "先逐条读「全部对话」（主人的话是语音识别出来的，可能有错字），像挑剔的用户一样挑出答得不好的：答非所问、"
+    "不懂装懂或说错、乱承诺做不到的事（她是板子上的语音助手，不能随口答应「今晚给你」「三周做完」）、"
+    "该动手做却只是嘴上讲、不认识自己（自己是什么、谁做的、能做什么）、太慢、太啰嗦、办不成事、反复问主人、"
+    "同一个问题被问好几次。再看「明显出问题的地方」和「日志信号」。\n"
+    "找出最影响主人体验、能靠改她自己的代码（提示词、路由、规则、流程）修好的问题，按严重程度排，最多 3 个。"
+    "主人亲身感受到的优先，纯日志噪音靠后。\n"
     "每个问题写清：现象（主人看到了什么）、证据（引用原话或日志行，带时间）、你猜的原因和可能的代码位置、"
     "修好以后怎么验证。不是代码问题的（主人自己没回答、网络断了、硬件没接）不要列；最近修过而且之后没再出现的不要列，"
     "修过但还在出现的可以再列，并说明上次没修好。\n"
@@ -102,6 +109,20 @@ def read_turns(learning_dir: Path, since: datetime) -> list[dict]:
     return out
 
 
+def turn_lines(turns: list[dict], budget: int = 0) -> list[str]:
+    """Every turn, the newest ones that fit: the teacher judges the answers the way the owner heard them."""
+    budget = budget or TURNS_CHARS
+    out, used = [], 0
+    for t in reversed(turns):
+        line = (f"[{t.get('time', '')[5:16]}] {t.get('who', '')}/{t.get('reason', '')}｜主人：{t.get('q', '')[:70]}"
+                f"｜她：{t.get('a', '')[:150]}")
+        if used + len(line) > budget:
+            break
+        out.append(line)
+        used += len(line) + 1
+    return out[::-1]
+
+
 def turn_findings(turns: list[dict]) -> list[str]:
     """The turns that went wrong, and the questions the owner had to ask again."""
     bad = []
@@ -140,7 +161,8 @@ def log_findings(text: str) -> list[str]:
     lines = text.splitlines()
     hits: dict[str, list[str]] = {}
     task_at, task_text = None, ""
-    silences = []
+    ask_at, ask_text = None, ""
+    silences, slow = [], []
     for i, line in enumerate(lines):
         for key, pat, _ in SIGNALS:
             if pat.search(line):
@@ -150,6 +172,13 @@ def log_findings(text: str) -> list[str]:
                     sample = (lines[i - 1][:120] + " … " if i else "") + " | ".join(x.strip()[:160] for x in tail[-3:])
                 hits.setdefault(key, []).append(sample)
         m = _TIME.match(line)
+        if m and _ASKED.search(line):
+            ask_at, ask_text = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)), line.split(": ", 1)[-1][:50]
+        elif m and ask_at is not None and "[tts] speak (1/" in line:
+            gap = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) - ask_at) % 86400
+            if gap > SLOW_S:
+                slow.append(f"{line[:8]} 「{ask_text}」{gap} 秒才说出答案")
+            ask_at = None
         if m and "[agent] task:" in line:
             task_at, task_text = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)), line[line.find("task:"):][:80]
         elif m and task_at is not None and "[tts] speak (1/" in line:
@@ -164,6 +193,8 @@ def log_findings(text: str) -> list[str]:
             out.append(f"{meaning}：{len(ex)} 次。例：" + "；".join(dict.fromkeys(ex[-3:])))
     if silences:
         out.append(f"接任务后长时间不出声：{len(silences)} 次。例：" + "；".join(silences[-3:]))
+    if slow:
+        out.append(f"回答慢（超过 {SLOW_S} 秒才说出答案）：{len(slow)} 次。例：" + "；".join(slow[-3:]))
     return out
 
 
@@ -203,8 +234,9 @@ def evidence(learning_dir: Path, root: Path = AGENT_ROOT, *, hours: float | None
     turns = read_turns(learning_dir, since)
     text, offset = read_log(root / "logs" / "orchestrator.log", None if hours is not None else st.get("log_offset"))
     parts = [f"检查范围：{since:%Y-%m-%d %H:%M} 以来，对话 {len(turns)} 轮。"]
-    tf, lf = turn_findings(turns), log_findings(text)
-    parts.append("对话里出问题的地方：\n" + ("\n".join(tf[-25:]) if tf else "（没有）"))
+    tf, lf, every = turn_findings(turns), log_findings(text), turn_lines(turns)
+    parts.append(f"全部对话（{len(every)} 轮；who/reason 是谁答的、为什么这样答）：\n" + ("\n".join(every) if every else "（没有）"))
+    parts.append("明显出问题的地方：\n" + ("\n".join(tf[-25:]) if tf else "（没有）"))
     parts.append("日志信号：\n" + ("\n".join(lf) if lf else "（没有）"))
     tried = []
     for r in recent_reviews(learning_dir):
@@ -216,7 +248,7 @@ def evidence(learning_dir: Path, root: Path = AGENT_ROOT, *, hours: float | None
     if len(body) > EVIDENCE_CHARS:
         body = body[:EVIDENCE_CHARS] + "\n…"
     new_state = {"last": time.strftime("%Y-%m-%d %H:%M:%S"), "log_offset": offset}
-    return body, {"found": bool(tf or lf), "state": new_state}
+    return body, {"found": bool(turns or lf), "state": new_state}
 
 
 def _project_state(slug: str, projects_root: Path | None) -> dict:
