@@ -36,6 +36,11 @@ def cn(n: int) -> str:
     return ("" if tens == 1 else _DIGITS[tens]) + "十" + (_DIGITS[ones] if ones else "")
 
 
+def count(n: int) -> str:
+    """A count: 两个, not 二个."""
+    return "两" if n == 2 else cn(min(n, 99))
+
+
 def say_time(t: datetime.datetime) -> str:
     part = "凌晨" if t.hour < 6 else "上午" if t.hour < 12 else "中午" if t.hour < 13 else "下午" if t.hour < 18 else "晚上"
     h = t.hour if t.hour <= 12 else t.hour - 12
@@ -142,13 +147,14 @@ def progress_say(learning_dir: Path = LEARNING, *, projects_root: Path | None = 
     parts.append("每天夜里的课照常在上" if any(enabled(u) for u in CLASS_UNITS) else "每天的课现在是停着的")
     open_spots = weakspots.load(learning_dir)["open"]
     if open_spots:
-        parts.append(f"还有{cn(min(len(open_spots), 99))}个短板没补上，比如{open_spots[0]['task'][:24]}")
+        example = re.split(r"[，,。？?；;]", open_spots[0]["task"])[0][:30]   # the first clause, never cut mid-word
+        parts.append(f"还有{count(len(open_spots))}个短板没补上，比如{example}")
     else:
         parts.append("短板清单是空的")
     tunes = selftune.recent(learning_dir, 50)
     if tunes:
         kept = sum(1 for r in tunes if r.get("decision") == "kept")
-        parts.append(f"自我优化试了{cn(min(len(tunes), 99))}轮，" + (f"留下了{cn(kept)}次新规矩" if kept else "还没有一轮留下新规矩"))
+        parts.append(f"自我优化试了{count(len(tunes))}轮，" + (f"留下了{count(kept)}次新规矩" if kept else "还没有一轮留下新规矩"))
     return "。".join(parts) + "。"
 
 

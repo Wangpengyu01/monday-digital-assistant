@@ -72,14 +72,15 @@ class SelfStatusTests(unittest.TestCase):
         pdir.mkdir()
         (pdir / "state.json").write_text(json.dumps({"slug": "p1", "goal": "写一个 Python 小工具", "status": "done",
                                                      "steps": 25}, ensure_ascii=False), encoding="utf-8")
-        weakspots.add(self.learning, "agent", "最占内存的进程属于哪个服务", "答成了不是 r1- 的服务", "eval")
+        weakspots.add(self.learning, "agent", "最占内存的进程属于哪个服务，它是不是咱们 r1- 的服务？", "答错", "eval")
         (self.learning / "selftune.jsonl").write_text('{"decision": "dropped"}\n{"decision": "aborted"}\n', encoding="utf-8")
         say = selfstatus.progress_say(self.learning, projects_root=self.projects, enabled=lambda u: False,
                                       active=lambda s: False)
         self.assertIn("上一个项目「写一个 Python 小工具」做完了", say)
         self.assertIn("每天的课现在是停着的", say)
         self.assertIn("还有一个短板没补上", say)
-        self.assertIn("自我优化试了二轮，还没有一轮留下新规矩", say)
+        self.assertIn("自我优化试了两轮，还没有一轮留下新规矩", say)
+        self.assertIn("比如最占内存的进程属于哪个服务。", say)
         busy = selfstatus.progress_say(self.learning, projects_root=self.projects, doing="查 196 的磁盘",
                                        enabled=lambda u: True, active=lambda s: False)
         self.assertTrue(busy.startswith("我手上正在办：查 196 的磁盘"))
