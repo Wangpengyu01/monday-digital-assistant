@@ -134,7 +134,7 @@ python3 -m learning.selfprompt rollback    # 退回上一版
   - 沙箱、上线流程、项目运行器、考卷、规矩守卫、预算、快照、配置、systemd 这些，批准了也不能由她改。
 - **怎么触发**：
   - 说"检查一下你自己""看看自己哪里傻""自己修修自己"。
-  - 也可以开每晚 01:30 的定时器 `r1-selfreview.timer`。定时器已装，但默认关着。
+  - 每晚 01:30 的定时器 `r1-selfreview.timer` 会自动跑一次。2026-11-07 主人要求打开，已经开了；关掉用 `sudo systemctl disable --now r1-selfreview.timer`。
   - 只看不动手：`python3 -m learning.selfreview --dry-run --hours 72`。
 - **记录**：每次检查记在 `run/learning/selfreview.jsonl`。下次检查会带上"最近修过的"和结果，修过但问题还在的会再列出来。
 
