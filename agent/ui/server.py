@@ -353,6 +353,12 @@ def projects_info() -> dict[str, Any]:
                         "pains": [{"owner": p["owner"], "a": p["a"][:80]} for p in w["pains"][-3:]],
                         "wins": [x["title"] for x in d["wins"][-3:]][::-1],
                         "grudges": [f"{g['title']}（试了 {g['tries']} 次）" for g in d["grudges"]][:3]}
+        from learning import spar
+        last = spar.latest()
+        if last:   # 陪练 (learning/spar.py): the teacher plays the owner, her local model answers
+            day, n = last
+            out["drive"]["spar"] = {"day": day, "turns": n["turns"], "ok": n["ok"], "kept": n["kept"],
+                                    "kinds": list(n["kinds"])[:3]}
     except Exception:  # noqa: BLE001 - the page works without it
         pass
     return out

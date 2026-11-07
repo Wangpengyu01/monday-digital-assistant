@@ -251,6 +251,13 @@ def evidence(learning_dir: Path, root: Path = AGENT_ROOT, *, hours: float | None
                  f"- {g['title']}（已经试了 {g['tries']} 次；上次没成是因为：{g.get('why', '')[:160]}）" for g in grudges)
                  if grudges else "（没有）"),
              f"检查范围：{since:%Y-%m-%d %H:%M} 以来，对话 {len(turns)} 轮。"]
+    from learning import spar
+
+    last = spar.latest(learning_dir)
+    if last and last[1]["turns"] and last[0] >= (since - timedelta(days=1)).date().isoformat():
+        day, n = last
+        parts.append(f"陪练里她常犯的毛病（{day}，老师扮成主人跟她聊了 {n['turns']} 句，答好 {n['ok']} 句；是模拟的，"
+                     "排在真实对话后面）：\n" + "\n".join(f"- {p}" for p in n["problems"][-8:]))
     tf, lf, every = turn_findings(turns), log_findings(text), turn_lines(turns)
     parts.append(f"全部对话（{len(every)} 轮；who/reason 是谁答的、为什么这样答）：\n" + ("\n".join(every) if every else "（没有）"))
     parts.append("明显出问题的地方：\n" + ("\n".join(tf[-25:]) if tf else "（没有）"))

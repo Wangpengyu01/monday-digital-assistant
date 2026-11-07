@@ -226,6 +226,10 @@ def say(learning_dir: Path = LEARNING) -> str:
     open_g = [g for g in d["grudges"] if g["tries"] < MAX_TRIES]
     if open_g:
         parts.append(f"还有{count(len(open_g))}个没修好，我不服气，还在换办法，比如{_short(open_g[0]['title'])}")
+    from learning import spar
+    sparred = spar.say(learning_dir)
+    if sparred:
+        parts.append(sparred)
     return "。".join(parts) + "。"
 
 
@@ -235,7 +239,7 @@ def _short(title: str) -> str:
 
 
 _ASK_DRIVE = re.compile(r"(?:你|星期一).{0,6}(?:在努力什么|努力什么|想变成|想成为|目标是什么|有什么目标|进步了吗|有进步吗|有没有进步|"
-                        r"心气|上进|想不想变好|想变好吗)")
+                        r"心气|上进|想不想变好|想变好吗|陪练)")
 
 
 def wants_drive(text: str) -> bool:

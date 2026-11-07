@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly 陪练 at 03:00 (after the 01:30 self-check; off-peak; stops when the owner talks)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
