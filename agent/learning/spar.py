@@ -49,6 +49,7 @@ LOG = logging.getLogger("spar")
 TAG = "陪练"
 MAX_TURNS = 5            # per session
 NIGHT_YUAN = 3.0
+NIGHT_TURNS = 300        # a night's data stays a part of the training mix, not most of it
 MONTH_YUAN = 60.0
 SEEDS = 40               # real owner sentences shown to the teacher playing him
 HIST_Q, HIST_A, HIST_N = 40, 70, 4   # the last turns as the live prompt clips them (orchestrator _history_for_prompt)
@@ -68,8 +69,10 @@ JUDGE_SYSTEM = (
     "乱承诺做不到的事（她不能定闹钟提醒、不能到点主动开口、不能连夜开发、不能保证几天几周交付）、不认识自己、太啰嗦、"
     "没听懂主人的错字、该答的推脱掉、念出代码符号路径、结尾问还需要什么。\n"
     "好就 ok 为 true。不好就写出她应该怎么答：星期一的口吻，一到三句，先说结论，纯口语，数字用中文说法，能直接念；"
-    "需要实时信息或确实不知道的就直说，说去问问老师，不编造。\n"
-    '只输出 JSON：{"ok": true或false, "kind": "答非所问|说错|编造|乱承诺|不认识自己|啰嗦|没听懂|推脱|念不出|其他", '
+    "需要实时信息或确实不知道的就直说，说去问问老师，不编造。你写的应答也不许有你拿不准的说法。\n"
+    "先在 check 里一步步核对：她说的每个事实、数字、换算和计算对不对（要算就真的算出来，比如 3 英尺 = 3 × 30.48 = 91.44 厘米），"
+    "再下结论。\n"
+    '只输出 JSON：{"check": "逐条核对的过程", "ok": true或false, "kind": "答非所问|说错|编造|乱承诺|不认识自己|啰嗦|没听懂|推脱|念不出|其他", '
     '"problem": "不好在哪", "better": "应该这样答"}（ok 为 true 时 kind、problem、better 留空）'
 )
 
@@ -160,7 +163,7 @@ def judge(teacher, persona: str, facts: str, transcript: list[tuple[str, str]], 
 
     before = "\n".join(f"主人：{x}\n星期一：{y}" for x, y in transcript[-HIST_N:]) or "（这是第一句）"
     user = (f"她的人设：\n{persona}\n\n关于她的事实：{facts}\n\n前面的对话：\n{before}\n\n主人：{q}\n她答：{a}")
-    d = json_object(teacher.complete(JUDGE_SYSTEM, user, json_mode=True, max_tokens=400, timeout_s=60))
+    d = json_object(teacher.complete(JUDGE_SYSTEM, user, json_mode=True, max_tokens=800, timeout_s=90))
     kind = str(d.get("kind") or "其他")
     return {"ok": bool(d.get("ok")), "kind": kind if kind in KINDS else "其他",
             "problem": str(d.get("problem") or "")[:160], "better": str(d.get("better") or "").strip()}
@@ -264,7 +267,7 @@ def spent(day: str | None = None, month: bool = False) -> float:
 
 
 def night(teacher, ask: Callable[[list[dict]], str], *, persona: str, facts: str, learning_dir: Path = LEARNING,
-          minutes: float = 120, max_yuan: float = NIGHT_YUAN, month_yuan: float = MONTH_YUAN,
+          minutes: float = 120, max_yuan: float = NIGHT_YUAN, month_yuan: float = MONTH_YUAN, max_turns: int = NIGHT_TURNS,
           idle: Callable[[], bool] = lambda: True, blocked: Callable[[], bool] = lambda: False,
           cost: Callable[[], tuple[float, float]] | None = None, rng: random.Random | None = None) -> dict:
     """Sessions until the time, the night's budget or the month's runs out, the peak starts or the owner talks."""
@@ -284,6 +287,9 @@ def night(teacher, ask: Callable[[list[dict]], str], *, persona: str, facts: str
             break
         if blocked():
             why = "peak"
+            break
+        if sum(len(s["turns"]) for s in done) >= max_turns:
+            why = "turns"
             break
         if not idle():
             why = "owner"
@@ -325,6 +331,7 @@ def main() -> None:
     ap.add_argument("--config", default="/userdata/agent/config/agent.yaml")
     ap.add_argument("--minutes", type=float, default=120)
     ap.add_argument("--max-yuan", type=float, default=NIGHT_YUAN)
+    ap.add_argument("--max-turns", type=int, default=NIGHT_TURNS)
     ap.add_argument("--any-time", action="store_true", help="also in the teacher's peak hours")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -337,7 +344,7 @@ def main() -> None:
     rt = build_runtime(a.config)
     run_dir = AGENT_ROOT / "run"
     res = night(rt.teacher, board_student(), persona=exam.persona(a.config), facts=version_say(),
-                learning_dir=rt.learning_dir, minutes=a.minutes, max_yuan=a.max_yuan,
+                learning_dir=rt.learning_dir, minutes=a.minutes, max_yuan=a.max_yuan, max_turns=a.max_turns,
                 idle=lambda: time.time() - last_activity(run_dir) > IDLE_MIN * 60,
                 blocked=(lambda: False) if a.any_time else usage.peak_blocked)
     print(json.dumps(res, ensure_ascii=False, indent=1))

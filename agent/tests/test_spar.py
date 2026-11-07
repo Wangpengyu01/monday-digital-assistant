@@ -116,6 +116,12 @@ class SparTests(unittest.TestCase):
         self.assertIn(say, drive.say(self.dir))
         self.assertTrue(drive.wants_drive("你昨晚陪练得怎么样"))
 
+    def test_a_night_stops_at_its_turn_cap(self) -> None:
+        t = Teacher([{"say": f"问题{i}", "end": True} for i in range(5)], [{"ok": True}] * 5)
+        res = spar.night(t, self.her(["好的。"] * 5), persona=PERSONA, facts="", learning_dir=self.dir,
+                         cost=lambda: (0.0, 0.0), max_turns=2, rng=random.Random(3))
+        self.assertEqual((res["sessions"], res["why"]), (2, "turns"))
+
     def test_peak_and_month_cap(self) -> None:
         t = Teacher([], [])
         self.assertEqual(spar.night(t, self.her([]), persona=PERSONA, facts="", learning_dir=self.dir,
