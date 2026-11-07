@@ -1,0 +1,2765 @@
+"""Asyncio orchestrator — Phase E: voice pipeline + WebSocket event API."""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import re
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import uuid
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable
+
+_AGENT_ROOT = Path(__file__).resolve().parent.parent
+if str(_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AGENT_ROOT))
+
+from api.debug_audio import DebugAudioController, handle_debug_audio
+from api.debug_info import build_debug_snapshot, format_debug_snapshot
+from api.event_bus import EventBus
+from orchestrator.mediamtx_camera import (
+    MediamtxCameraConfig,
+    copy_mediamtx_cache_file,
+    grab_mediamtx_vlm_pair,
+    mediamtx_cache_age_sec,
+    mediamtx_cache_available,
+    mediamtx_cache_fresh,
+    preview_jpeg_bytes_valid,
+    uses_mediamtx,
+)
+from api.ws_server import run_ws_server
+from audio.audio_profile import (
+    AudioProfileManager,
+    speaker_gain_to_percent,
+    speaker_pcm_to_percent,
+)
+from asr.asr_engine import AsrEngine, AsrEngineConfig
+from asr.normalize import normalize_user_text
+from asr.sense_voice import SenseVoiceConfig
+from asr.sherpa_streaming_asr import StreamingParaformerConfig
+from asr.vad_stream import VadConfig, VadStream
+from llm.client import LlmUnavailableError, llm_chat_stream, llm_clear_history, llm_ping
+from orchestrator.quick_reply import ACK_GROUPS, ACK_PHRASES, ack_for, ack_kind, fixed_replies, quick_reply_for, strip_leading_ack
+from orchestrator.user_title import DEFAULT_TITLE, apply_title, parse_title_command
+from orchestrator.volume_command import parse_volume_command
+from orchestrator import selftest
+from learning.brain import MEMO_MARK, Learner, MemoFilter, Route, is_correction, parse_memo, route, teacher_system
+from learning.agent import Agent, AgentResult, known_ssh_hosts, approval_answer, describe_step, is_agent_task
+from learning.credentials import Credentials, extract_credentials, install_log_redaction, mask_secrets
+from learning.drill import local_planner
+from learning import selfprompt
+from learning.sandbox import available as sandbox_available, run_step as sandbox_run_step
+from learning.grants import GrantStore
+from learning.intent import classify as classify_intent, recent_block
+from learning.journal import log_turn
+from learning.mcp import McpHub
+from learning.skills import SkillStore
+from learning.memory import MemoryStore
+from learning.teacher import DeepSeekTeacher, TeacherUnavailable
+from devices.voice import DeviceAgent, parse_command as parse_device_command
+from orchestrator.config_loader import load_yaml
+from orchestrator.dialogue_policy import (
+    can_barge_in,
+    is_resume_command,
+    is_stop_command,
+    is_vision_query,
+    normalize_spoken_text,
+)
+from orchestrator.events import AgentState
+from settings.store import UserSettingsStore
+from tts.sentence_split import (
+    set_keep_latin,
+    StreamingSentenceSplitter,
+    canned_reply_for,
+    clean_llm_reply,
+    is_closing_filler,
+    extract_speak_sentences,
+    is_echo_reply,
+    is_self_echo,
+    is_speakable,
+    persona_reply_for,
+    sanitize_tts_text,
+    should_skip_llm,
+    split_tts_clauses,
+)
+from tts.tts_engine import TtsConfig, TtsEngine
+from tts.tts_queue import TtsQueue
+from tts.voice_settings import VoiceSettingsManager, is_voice_settings_query
+
+LOG = logging.getLogger("orchestrator")
+
+
+# fixed sentences said outside quick replies; pre-synthesized with them (see _warm_ack_cache)
+FIXED_SPOKEN = (
+    "好的，主人。",
+    "随时待命，主人请吩咐。",
+    "主人，大模型正在启动，请稍等半分钟再问我。",
+    "主人，刚才没处理好，请再说一遍。",
+)
+
+
+def _est_tokens(text: str) -> int:
+    """Qwen3.5 tokenizer, measured on our Chinese prompts: ~0.57 token per character; rounded up for safety."""
+    return int(len(text or "") * 0.62) + 2
+
+
+def _clip(text: str, n: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def _wav_seconds(path: Path) -> float:
+    import wave
+
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / float(w.getframerate() or 1)
+
+
+# Sampling TTS (qwen3) now and then returns near-silence with a short blip. 2026-11-07: the cached
+# noon greeting clip ("中午好，<name>。") was 13 % voiced and the owner heard nothing at noon; every good cached clip
+# measured 41 % or more (100 ms windows above RMS 300).
+MIN_VOICED_SHARE = 0.25
+
+
+def _wav_voiced_share(path: Path, threshold: int = 300) -> float:
+    """Share of 100 ms windows of a 16-bit WAV that carry sound (RMS above threshold)."""
+    import array
+    import wave
+
+    with wave.open(str(path), "rb") as w:
+        if w.getsampwidth() != 2:
+            return 1.0
+        win = max(1, w.getframerate() * w.getnchannels() // 10)
+        samples = array.array("h", w.readframes(w.getnframes()))
+    if sys.byteorder == "big":
+        samples.byteswap()
+    total = loud = 0
+    for i in range(0, len(samples), win):
+        seg = samples[i:i + win]
+        total += 1
+        if sum(x * x for x in seg) > threshold * threshold * len(seg):
+            loud += 1
+    return loud / total if total else 0.0
+
+
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _spoken_step(step: dict) -> str:
+    """What an agent step does, short enough to say out loud: "跑 avahi-browse", "登录 196 跑 df"."""
+    tool = step.get("tool")
+    if tool == "mcp":
+        return f"调用 {step.get('server')} 的 {step.get('name')}"
+    if tool == "ssh_key_setup":
+        return f"用你给的密码登录 {step.get('host')} 装公钥"
+    if tool == "note":
+        return f"写笔记 {step.get('name')}"
+    words = [w for w in re.split(r"\s+|&&|;|\|", str(step.get("cmd") or "")) if w]
+    while words and words[0] in ("sudo", "cd", "env") or (words and "=" in words[0]):
+        words = words[2:] if words[0] == "cd" else words[1:]
+    prog = words[0].rsplit("/", 1)[-1] if words else "一条命令"
+    return f"登录 {step.get('host')} 跑 {prog}" if tool == "ssh" else f"跑 {prog}"
+
+
+class Orchestrator:
+    camera_enabled: bool = False
+    camera_url: str = "http://10.0.0.159:8080/shot.jpg"
+    camera_timeout: float = 2.5
+    camera_size: int = 448
+    camera_prompt: str = "用一句话简短描述画面中的核心物品和场景。"
+    camera_vlm_cmd: str = "/userdata/p4/scripts/vlm_see.sh"
+    camera_api_url: str = ""
+    camera_api_key: str = ""
+    camera_model: str = "qwen-vl-plus"
+
+    def __init__(self, cfg: dict[str, Any], agent_root: Path) -> None:
+        self.cfg = cfg
+        self.agent_root = agent_root
+        self.state = AgentState.IDLE
+        self.vad_queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._turn_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=2)
+        self._asr_session = None
+        self._listen_cooldown_until = 0.0
+        self._turn_busy = False
+        self._speaking = False
+        self._tts_abort = False
+        self._active_tts_text = ""
+        self._last_spoken_turn = ""
+        self._last_tts_end_at = 0.0
+        self._paused_relay_text: str | None = None
+        self._current_splitter: Any = None
+        self._next_turn_id = 0
+        self._active_turn_id = 0
+        self._ws_server: asyncio.Server | None = None
+        self._vad_restart = asyncio.Event()
+        self._debug_vad_paused = False
+
+        vad_cfg = cfg.get("vad") or {}
+        asr_cfg = cfg.get("asr") or {}
+        tts_cfg = cfg.get("tts") or {}
+        api_cfg = cfg.get("api") or {}
+        paths = cfg.get("paths") or {}
+        barge_cfg = cfg.get("barge_in") or {}
+        cam_cfg = cfg.get("camera") or {}
+
+        self.event_bus = EventBus()
+        self.api_enabled = str(api_cfg.get("enabled", "true")).lower() not in ("0", "false", "no")
+        self.api_host = str(api_cfg.get("host", "0.0.0.0"))
+        self.api_port = int(api_cfg.get("port", 8765))
+        self.barge_in_enabled = str(barge_cfg.get("enabled", "true")).lower() not in ("0", "false", "no")
+        self.barge_in_min_sec = float(barge_cfg.get("min_speech_sec", 0.35))
+
+        self.camera_enabled = str(cam_cfg.get("enabled", "true")).lower() not in ("0", "false", "no")
+        self.camera_url = str(cam_cfg.get("url", "http://10.0.0.159:8080/shot.jpg"))
+        rtsp_env = Path("/userdata/p4/config/rtsp.env")
+        if rtsp_env.is_file():
+            for line in rtsp_env.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("RTSP_URL="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        self.camera_url = val
+                    break
+        self.camera_rtsp_transport = str(cam_cfg.get("rtsp_transport", "tcp")).strip()
+        self.camera_timeout = float(cam_cfg.get("timeout", 2.5))
+        self.camera_size = int(cam_cfg.get("size", 448))
+        self.camera_prompt = str(cam_cfg.get("prompt", "用一句话简短描述画面中的核心物品和场景。"))
+        self.camera_see_max_new_tokens = int(cam_cfg.get("see_max_new_tokens", 96))
+        self.camera_vlm_cmd = str(cam_cfg.get("vlm_cmd", "/userdata/p4/scripts/vlm_see.sh"))
+        self.camera_api_url = str(cam_cfg.get("api_url", "")).strip()
+        self.camera_api_key = str(cam_cfg.get("api_key", "")).strip()
+        self.camera_model = str(cam_cfg.get("model", "qwen-vl-plus")).strip()
+        self.proactive_enabled = str(cam_cfg.get("proactive_enabled", "true")).lower() not in ("0", "false", "no")
+        self.proactive_interval_sec = float(cam_cfg.get("proactive_interval_sec", 2.5))
+        self.proactive_motion_threshold = float(cam_cfg.get("proactive_motion_threshold", 4.0))
+        self.proactive_cooldown_sec = float(cam_cfg.get("proactive_cooldown_sec", 35.0))
+        mtx = cam_cfg.get("mediamtx") or {}
+        self.camera_grab_backend = str(cam_cfg.get("grab_backend", "rtsp")).strip().lower()
+        mtx_path = str(mtx.get("path", cam_cfg.get("mediamtx_path", "cam"))).strip() or "cam"
+        self.mediamtx_cfg = MediamtxCameraConfig(
+            path=mtx_path,
+            rtsp_url=str(mtx.get("rtsp_url", f"rtsp://127.0.0.1:8554/{mtx_path}")),
+            whep_url=str(mtx.get("whep_url", f"http://127.0.0.1:8889/{mtx_path}/whep")),
+            latest_frame=str(mtx.get("latest_frame", str(agent_root / "run" / "mediamtx_latest.jpg"))),
+            cache_max_age_sec=float(mtx.get("cache_max_age_sec", 0.8)),
+            grab_backend=self.camera_grab_backend,
+        )
+        if self.camera_grab_backend.startswith("mediamtx") or self.camera_grab_backend == "whep":
+            self.camera_url = self.mediamtx_cfg.rtsp_url
+            LOG.info(
+                "[camera] mediamtx grab_backend=%s whep=%s rtsp=%s",
+                self.camera_grab_backend,
+                self.mediamtx_cfg.whep_url,
+                self.mediamtx_cfg.rtsp_url,
+            )
+        self._last_proactive_speak_at = 0.0
+        self._latest_camera_bytes: bytes | None = None
+        self._latest_camera_time: float = 0.0
+        self._scene_memory_file = self.agent_root / "run" / "scene_memory.json"
+        self._scene_memory: dict[str, Any] = self._load_scene_memory()
+
+        self.vad_config = VadConfig(
+            model_path=vad_cfg.get("model", "/userdata/voice/silero_vad.onnx"),
+            sherpa_lib=vad_cfg.get(
+                "sherpa_lib",
+                "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/lib",
+            ),
+            sample_rate=int(vad_cfg.get("sample_rate", 16000)),
+            chunk_ms=int(vad_cfg.get("chunk_ms", 100)),
+            threshold=float(vad_cfg.get("threshold", 0.5)),
+            min_silence_duration=float(vad_cfg.get("min_silence_duration", 0.4)),
+            min_speech_duration=float(vad_cfg.get("min_speech_duration", 0.25)),
+            max_speech_duration=float(vad_cfg.get("max_speech_duration", 30.0)),
+            alsa_device=str(vad_cfg.get("alsa_device", "plughw:0,0")),
+            min_segment_sec=float(vad_cfg.get("min_segment_sec", 0.5)),
+            speech_preroll_ms=int(vad_cfg.get("speech_preroll_ms", 400)),
+            speech_tail_pad_ms=int(vad_cfg.get("speech_tail_pad_ms", 0)),
+            arecord_period_size=int(vad_cfg.get("arecord_period_size", 320)),
+            arecord_buffer_size=int(vad_cfg.get("arecord_buffer_size", 2560)),
+            mic_capture_gain=int(vad_cfg.get("mic_capture_gain", 6)),
+        )
+        self.listen_cooldown_sec = float(vad_cfg.get("listen_cooldown_sec", 0.5))
+        self.listen_cooldown_skip_max_sec = float(vad_cfg.get("listen_cooldown_skip_max_sec", 0.45))
+        self.mute_mic_during_tts = str(vad_cfg.get("mute_mic_during_tts", "false")).lower() not in ("0", "false", "no")
+
+        audio_override = (cfg.get("_cli_audio_profile") or "").strip() or None
+        audio_cfg = cfg.get("audio") or {}
+        settings_path = Path(
+            audio_cfg.get("settings_path", str(agent_root / "run" / "user_settings.json"))
+        )
+        self.user_settings = UserSettingsStore(settings_path)
+        saved_user = self.user_settings.load()
+        self.audio_profile = AudioProfileManager.from_config(
+            cfg, agent_root, cli_override=audio_override
+        )
+        self.audio_profile.apply_user_overrides(
+            usb_mic_volume=saved_user.usb_mic_volume,
+            speaker_volume=saved_user.speaker_volume,
+            vad=saved_user.vad or None,
+        )
+        self.audio_profile.apply_to_vad(self.vad_config)
+
+        utterance = paths.get("utterance_wav", str(agent_root / "run" / "last_utterance.wav"))
+        asr_backend = str(asr_cfg.get("backend", "sense_voice")).strip().lower()
+        self.asr_engine = AsrEngine(
+            AsrEngineConfig(
+                backend=asr_backend,
+                sense_voice=SenseVoiceConfig(
+                    model_dir=asr_cfg.get(
+                        "model_dir",
+                        "/userdata/voice/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+                    ),
+                    sherpa_bin=asr_cfg.get(
+                        "sherpa_bin",
+                        "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/bin/sherpa-onnx-offline",
+                    ),
+                    sherpa_lib=asr_cfg.get(
+                        "sherpa_lib",
+                        "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/lib",
+                    ),
+                    language=str(asr_cfg.get("language", "zh")),
+                    num_threads=int(asr_cfg.get("num_threads", 2)),
+                ),
+                streaming_paraformer=StreamingParaformerConfig(
+                    model_dir=asr_cfg.get(
+                        "model_dir",
+                        "/userdata/voice/sherpa-onnx-streaming-paraformer-bilingual-zh-en",
+                    ),
+                    sherpa_lib=asr_cfg.get(
+                        "sherpa_lib",
+                        "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/lib",
+                    ),
+                    encoder=str(asr_cfg.get("encoder", "encoder.int8.onnx")),
+                    decoder=str(asr_cfg.get("decoder", "decoder.int8.onnx")),
+                    tokens=str(asr_cfg.get("tokens", "tokens.txt")),
+                    num_threads=int(asr_cfg.get("num_threads", 2)),
+                    sample_rate=int(vad_cfg.get("sample_rate", 16000)),
+                    final_tail_pad_sec=float(asr_cfg.get("final_tail_pad_sec", 0.5)),
+                ),
+                sample_rate=self.vad_config.sample_rate,
+                partial_interval_sec=float(asr_cfg.get("partial_interval_sec", 1.2)),
+                partial_min_sec=float(asr_cfg.get("partial_min_sec", 1.0)),
+                partial_enabled=str(asr_cfg.get("partial_enabled", "true")).lower() not in ("0", "false", "no"),
+                max_partials_per_utterance=int(asr_cfg.get("max_partials_per_utterance", 3)),
+                min_duration_sec=self.vad_config.min_segment_sec,
+                utterance_wav=utterance,
+                clip_peak_threshold=int(asr_cfg.get("clip_peak_threshold", 30000)),
+                clip_limit_ceiling=float(asr_cfg.get("clip_limit_ceiling", 0.85)),
+            )
+        )
+
+        self.socket_path = cfg.get("socket_path", "/tmp/r1-llm.sock")
+        from xiaolan_cli.brain import XiaolanBrain
+
+        infer_cfg = cfg.get("inference") or {}
+        backend = str(infer_cfg.get("backend", "llm_daemon"))
+        self.brain = XiaolanBrain(
+            self.agent_root,
+            socket_path=self.socket_path,
+            max_new_tokens=int(cfg.get("max_new_tokens", 128)),
+            backend=backend,
+        )
+        self.inference_backend = backend
+        self.max_new_tokens = int(cfg.get("max_new_tokens", 64))
+        self.history_max_turns = int(cfg.get("history_max_turns", 4))
+        # the local model's context (llm_daemon's ctx argument): history is fitted into what is left
+        self.llm_context_tokens = int(cfg.get("llm_context_tokens", 768))
+        self.history_idle_clear_sec = float(cfg.get("history_idle_clear_sec", 600))
+        dialog_cfg = cfg.get("dialog") or {}
+        self.user_title = (
+            saved_user.user_title
+            if saved_user.user_title is not None
+            else str(dialog_cfg.get("user_title", DEFAULT_TITLE))
+        )
+        self.quick_reply_enabled = str(dialog_cfg.get("quick_reply", "true")).lower() not in ("0", "false", "no")
+        self.ack_enabled = str(dialog_cfg.get("ack_before_answer", "true")).lower() not in ("0", "false", "no")
+        self._ack_cache: dict[str, Path] = {}
+        self.system_prompt = (cfg.get("system_prompt") or "").strip()
+        # learning: local memory + a teacher model for what the local model can't answer
+        learn_cfg = cfg.get("learning") or {}
+        teach_cfg = cfg.get("teacher") or {}
+        self.memory = MemoryStore(learn_cfg.get("db", "/userdata/agent/run/learning/memory.db"))
+        self.learner = Learner(self.memory, Path(learn_cfg.get("lora_log", "/userdata/agent/run/learning/lora_data.jsonl")))
+        # every turn, for the nightly self-review (learning/reflect.py)
+        self.journal_dir = Path(learn_cfg.get("journal_dir", "/userdata/agent/run/learning/turns"))
+        # things it learned how to *do* (learning/agent.py), in the same database
+        # external MCP tool servers for the agent (config: mcp.servers), started on first use
+        self.mcp = McpHub.from_config(cfg.get("mcp"))
+        self.skills = SkillStore(Path(learn_cfg.get("db", "/userdata/agent/run/learning/memory.db")))
+        # "允许并记住": standing permissions for ask-level agent steps (same database, revocable in the web page)
+        self.grants = GrantStore(Path(learn_cfg.get("db", "/userdata/agent/run/learning/memory.db")))
+        self._agent_task: asyncio.Task | None = None
+        self._agent_pending: dict[str, asyncio.Future] = {}
+        self._pending_creds: Credentials | None = None  # a password just said/typed, for the agent turn only
+        self._recent: list[dict] = []  # last turns (any route): context for the intent classifier and the teacher
+        install_log_redaction()
+        self.agent_approval_timeout = float(learn_cfg.get("agent_approval_timeout", 90))
+        # the local model tries read-only tasks itself before asking the teacher (off until a LoRA passes eval)
+        self.agent_local_first = bool(learn_cfg.get("agent_local_first", False))
+        # ask-level shell steps run in a read-only, offline sandbox (learning.sandbox) instead of asking
+        self.agent_sandbox = bool(learn_cfg.get("agent_sandbox", True)) and sandbox_available()
+        if self.agent_sandbox:
+            LOG.info("[agent] sandbox on (bwrap): read-only commands run without asking")
+        self.teacher_enabled = bool(teach_cfg.get("enabled", True))
+        self.teacher = DeepSeekTeacher(
+            base_url=str(teach_cfg.get("base_url", "https://api.deepseek.com")),
+            model=str(teach_cfg.get("model", "deepseek-flash")),
+            api_key_env=str(teach_cfg.get("api_key_env", "DEEPSEEK_API_KEY")),
+            timeout_s=float(teach_cfg.get("timeout_s", 20)),
+            max_tokens=int(teach_cfg.get("max_tokens", 400)),
+        )
+        self._last_qa: tuple[str, str] | None = None
+        # devices at home: LAN scan, names, encrypted accounts (entered on the :8767 page)
+        try:
+            self.devices = DeviceAgent((cfg.get("devices") or {}).get("run_dir", "/userdata/agent/run/devices"))
+        except Exception as exc:  # the voice assistant must come up even if this part can't
+            LOG.warning("[devices] disabled: %s", exc)
+            self.devices = None
+        self._chat_turns: list[tuple[str, str]] = []
+        self._llm_last_turn_at = 0.0
+        self.voice_settings = VoiceSettingsManager.from_config(tts_cfg)
+        if saved_user.voice_id:
+            self.voice_settings.apply(voice_id=saved_user.voice_id)
+        if saved_user.speed is not None:
+            self.voice_settings.apply(speed=saved_user.speed)
+        tts_engine = TtsEngine(self._tts_config_from_voice())
+        tts_engine.set_playback_env(self.audio_profile.playback_env())
+        self.tts_queue = TtsQueue(
+            tts_engine,
+            merge_max_chars=int(tts_cfg.get("merge_max_chars", 40)),
+        )
+        self.tts_queue.text_filter = self._apply_title
+        set_keep_latin(getattr(tts_engine, "streaming", False))  # Qwen3-TTS reads English itself
+        self.vad_stream = VadStream(self.vad_config, self.vad_queue)
+        self.debug_audio = DebugAudioController(self)
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _tts_config_from_voice(self) -> TtsConfig:
+        tts_cfg = self.cfg.get("tts") or {}
+        profile = self.voice_settings.active_profile()
+        rt = self.voice_settings.runtime
+        return TtsConfig(
+            backend=profile.backend,
+            model_dir=profile.model_dir,
+            model_file=profile.model_file,
+            vocoder=profile.vocoder or self.voice_settings.default_vocoder,
+            rule_fsts=list(profile.rule_fsts or tts_cfg.get("rule_fsts") or []),
+            play_script=self.audio_profile.active.play_script,
+            sherpa_bin=tts_cfg.get(
+                "sherpa_bin",
+                "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/bin/sherpa-onnx-offline-tts",
+            ),
+            sherpa_lib=tts_cfg.get(
+                "sherpa_lib",
+                "/userdata/voice/sherpa-onnx-v1.12.8-linux-aarch64-shared-cpu/lib",
+            ),
+            num_threads=int(tts_cfg.get("num_threads", 2)),
+            sid=profile.sid,
+            speed=rt.speed,
+            noise_scale=float(
+                profile.noise_scale
+                if profile.noise_scale is not None
+                else tts_cfg.get("noise_scale", 0.667)
+            ),
+            max_chars=int(tts_cfg.get("max_chars", 80)),
+            qwen3_socket=str(tts_cfg.get("qwen3_socket", "/tmp/r1-tts.sock")),
+        )
+
+    async def _sync_tts_from_voice_settings(self) -> None:
+        await self.tts_queue.reconfigure(self._tts_config_from_voice())
+        set_keep_latin(getattr(self.tts_queue.engine, "streaming", False))
+        self._ack_cache = {}
+        self.tts_queue.clip_cache = {}
+        asyncio.create_task(self._warm_ack_cache())
+        self.tts_queue.engine.set_playback_env(self.audio_profile.playback_env())
+        p = self.voice_settings.active_profile()
+        rt = self.voice_settings.runtime
+        LOG.info(
+            "[voice] synced tts voice=%s backend=%s sid=%d model=%s",
+            rt.voice_id,
+            p.backend,
+            p.sid,
+            p.model_path(),
+        )
+        await self.emit(
+            {
+                "type": "voice_settings",
+                "voice_id": rt.voice_id,
+                "label": p.label,
+                "speed": rt.speed,
+            }
+        )
+
+    async def _selftest_report(self, *, full: bool) -> str:
+        tts_sock = None
+        engine = self.tts_queue.engine
+        if getattr(engine, "streaming", False):
+            tts_sock = engine.cfg.qwen3_socket
+        checks = await asyncio.to_thread(
+            selftest.run_checks, llm_sock=self.socket_path, llm_ping=llm_ping, tts_sock=tts_sock
+        )
+        for c in checks:
+            LOG.info("[selftest] %s: %s %s", c.name, "ok" if c.ok else "FAIL", c.detail if c.ok else c.problem)
+        return selftest.announcement(checks, full=full)
+
+    async def _boot_selftest(self) -> None:
+        """Once per boot: wait for the models, check everything, say one sentence."""
+        marker = self.agent_root / "run" / "selftest_boot_id"
+        boot_id = selftest.current_boot_id()
+        try:
+            if boot_id and marker.is_file() and marker.read_text().strip() == boot_id:
+                return  # already announced this boot (service restarted by a deploy)
+        except OSError:
+            pass
+        text = await self._selftest_report(full=True)
+        try:
+            marker.write_text(boot_id + "\n")
+        except OSError:
+            pass
+        if self._turn_busy or self._speaking:
+            LOG.info("[selftest] busy, not announcing: %s", text)
+            return
+        self._next_turn_id += 1
+        generation = self._next_turn_id
+        self._active_turn_id = generation
+        self._tts_abort = False
+        self.tts_queue.mark_utterance_start(generation)
+        await self._speak_turn(text, generation=generation)
+        await self.tts_queue.wait_done(generation=generation)
+        if generation == self._active_turn_id and not self._turn_busy:
+            self.set_state(AgentState.LISTEN)
+
+    async def _notice_loop(self, every: float = 20.0) -> None:
+        """Say queued notices (run/notices/*.txt, e.g. a project that finished - learning/project.py) when idle."""
+        folder = self.agent_root / "run" / "notices"
+        await asyncio.sleep(60)
+        while True:
+            await asyncio.sleep(every)
+            try:
+                files = sorted(folder.glob("*.txt")) if folder.is_dir() else []
+                if not files or self._turn_busy or self._speaking or getattr(self, "_agent_running", False):
+                    continue
+                text = files[0].read_text(encoding="utf-8").strip()
+                files[0].unlink()
+            except OSError:
+                continue
+            if not text:
+                continue
+            LOG.info("[notice] %s", text[:120])
+            self._next_turn_id += 1
+            generation = self._next_turn_id
+            self._active_turn_id = generation
+            self._tts_abort = False
+            self.tts_queue.mark_utterance_start(generation)
+            await self._emit_reply_final(text)
+            await self._speak_turn(text, generation=generation)
+            await self.tts_queue.wait_done(generation=generation)
+            if generation == self._active_turn_id and not self._turn_busy:
+                self.set_state(AgentState.LISTEN)
+
+    async def _selfheal_notice(self, delay: float = 45.0) -> None:
+        """Say what the self-heal watchdog (ops/selfheal.py) did while we were down - e.g. a rollback - once."""
+        path = self.agent_root / "run" / "selfheal_notice.txt"
+        await asyncio.sleep(delay)  # after the models are up and the boot self-test has spoken
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            path.unlink()
+        except OSError:
+            return
+        if text:
+            LOG.info("[selfheal] notice: %s", text)
+            await self._emit_reply_final(text)
+            await self._agent_say(text)
+
+    def _apply_title(self, text: str) -> str:
+        return apply_title(text, getattr(self, "user_title", DEFAULT_TITLE))
+
+    async def _set_user_title(self, title: str) -> None:
+        self.user_title = title
+        self.user_settings.patch({"user_title": title})
+        LOG.info("[dialog] user title -> %r", title)
+        asyncio.create_task(self._warm_ack_cache())  # fixed replies contain the title
+        await self.emit({"type": "user_title", "value": title})
+
+    async def emit(self, event: dict[str, Any]) -> None:
+        if isinstance(event.get("text"), str) and event.get("type") not in ("asr_partial", "asr_final"):
+            event = {**event, "text": self._apply_title(event["text"])}
+        if isinstance(event.get("text"), str):
+            event = {**event, "text": mask_secrets(event["text"])}  # a password said aloud never reaches the page
+        await self.event_bus.publish(event)
+
+    def set_state(self, new: AgentState) -> None:
+        if new != self.state:
+            LOG.info("[state] %s -> %s", self.state.value, new.value)
+            self.state = new
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.emit({"type": "state", "value": new.value}))
+            except RuntimeError:
+                if self._loop and self._loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.emit({"type": "state", "value": new.value}), self._loop
+                    )
+
+    def ping_llm_daemon(self) -> bool:
+        if not Path(self.socket_path).exists():
+            LOG.warning("[llm] socket missing: %s", self.socket_path)
+            return False
+        try:
+            ok = llm_ping(self.socket_path)
+            LOG.info("[llm] ping %s", "ok" if ok else "fail")
+            return ok
+        except OSError as exc:
+            LOG.warning("[llm] ping failed: %s", exc)
+            return False
+
+    def _new_asr_session(self):
+        session: Any = None
+        last_partial = ""
+
+        async def on_partial(text: str) -> None:
+            nonlocal last_partial
+            LOG.info("[event] asr_partial: %s", text)
+            await self.emit({"type": "asr_partial", "text": text})
+            if self.barge_in_enabled and self._speaking and text.strip():
+                clean_p = normalize_spoken_text(text)
+                if not clean_p:
+                    return
+                cur_speak = (
+                    (self._active_tts_text or "")
+                    + " "
+                    + (getattr(self.tts_queue, "_current_speaking_chunk", "") or "")
+                    + " "
+                    + (self._last_spoken_turn or "")
+                ).strip()
+                if cur_speak and is_self_echo(cur_speak, clean_p):
+                    LOG.info("[barge-in] self-acoustic feedback detected: %s", clean_p[:15])
+                    return
+                if is_stop_command(clean_p):
+                    LOG.info("[barge-in] stop command matched: %s", clean_p)
+                    await self._interrupt_tts()
+                    return
+                speech_sec = session.buffer_sec if session is not None else 0.0
+                if not can_barge_in(clean_p, speech_sec, self.barge_in_min_sec):
+                    return
+                if clean_p.startswith(last_partial) and len(clean_p) > len(last_partial):
+                    delta = clean_p[len(last_partial) :]
+                else:
+                    delta = clean_p[-4:]
+                last_partial = clean_p
+                if delta and cur_speak and is_self_echo(cur_speak, delta):
+                    LOG.info("[barge-in] self-acoustic feedback delta ignored: %s", delta)
+                    return
+                LOG.info("[barge-in] user speech after %.2fs, interrupting TTS: %s", speech_sec, text)
+                await self._interrupt_tts()
+
+        async def on_final(text: str, meta: dict) -> None:
+            LOG.info("[event] asr_final: %s", text or meta.get("status"))
+            await self.emit({"type": "asr_final", "text": text, "meta": meta})
+            if self.barge_in_enabled and self._speaking and text.strip():
+                clean_f = normalize_spoken_text(text)
+                cur_speak = (
+                    (self._active_tts_text or "")
+                    + " "
+                    + (getattr(self.tts_queue, "_current_speaking_chunk", "") or "")
+                    + " "
+                    + (self._last_spoken_turn or "")
+                ).strip()
+                if is_stop_command(clean_f) and not (cur_speak and is_self_echo(cur_speak, clean_f)):
+                    LOG.info("[barge-in] final stop command matched: %s", clean_f)
+                    await self._interrupt_tts()
+
+        session = self.asr_engine.create_session(on_partial, on_final)
+        self._asr_session = session
+        return session
+
+    async def _interrupt_tts(self) -> None:
+        if not self._speaking:
+            return
+        LOG.info("[barge-in] interrupt TTS playback immediately")
+        self._tts_abort = True
+        self._speaking = False
+        self._last_tts_end_at = time.monotonic()
+        self._listen_cooldown_until = 0.0
+        pending = await self.tts_queue.interrupt()
+        relay_parts = list(pending)
+        if getattr(self, "_current_splitter", None):
+            rem = self._current_splitter.finish()
+            for r in rem:
+                if r not in relay_parts:
+                    relay_parts.append(r)
+        if relay_parts:
+            self._paused_relay_text = "".join(relay_parts).strip()
+            LOG.info("[relay] saved %d pending clauses (%d chars) for resume: %s", len(relay_parts), len(self._paused_relay_text), self._paused_relay_text[:40])
+        await self.emit({"type": "barge_in", "phase": "tts"})
+
+    async def handle_ws_message(self, text: str) -> None:
+        await self._handle_ws_message(text)
+
+    def _can_hot_swap_audio(self) -> bool:
+        return (
+            not self._turn_busy
+            and not self._speaking
+            and self.state in (AgentState.IDLE, AgentState.LISTEN)
+        )
+
+    def _speaker_volume_percent(self) -> int:
+        active = self.audio_profile.active
+        if active.profile_id == "fy_sp701":
+            return speaker_pcm_to_percent(active.usb_pcm_volume)
+        gain = float(active.playback_env.get("PLAYBACK_GAIN", "2.0"))
+        return speaker_gain_to_percent(gain)
+
+    async def _build_settings_snapshot(self) -> dict[str, Any]:
+        saved = self.user_settings.load()
+        rt = self.voice_settings.runtime
+        voice = self.voice_settings.active_profile()
+        audio_choice = saved.audio_profile or str(
+            (self.cfg.get("audio") or {}).get("default_profile", "auto")
+        )
+        return {
+            "type": "settings_snapshot",
+            "state": self.state.value,
+            "audio_profiles": [
+                {"id": pid, "label": label} for pid, label in AudioProfileManager.PROFILE_CHOICES
+            ],
+            "audio_profile": audio_choice,
+            "active_audio_profile": self.audio_profile.active.profile_id,
+            "active_audio_label": self.audio_profile.active.label,
+            "voices": [
+                {
+                    "id": p.voice_id,
+                    "label": p.label,
+                    "available": p.available(),
+                }
+                for p in self.voice_settings.profiles.values()
+            ],
+            "voice_id": rt.voice_id,
+            "voice_label": voice.label,
+            "speed": rt.speed,
+            "speed_min": self.voice_settings.speed_min,
+            "speed_max": self.voice_settings.speed_max,
+            "usb_mic_volume": self.audio_profile.active.usb_mic_volume or 20000,
+            "usb_mic_volume_max": 24660,
+            "usb_mic_supported": self.audio_profile.active.profile_id == "fy_sp701",
+            "speaker_volume": self._speaker_volume_percent(),
+            "speaker_volume_min": 0,
+            "speaker_volume_max": 100,
+            "vad": {
+                "threshold": self.vad_config.threshold,
+                "min_silence_duration": self.vad_config.min_silence_duration,
+                "speech_tail_pad_ms": self.vad_config.speech_tail_pad_ms,
+            },
+            "can_change_audio": self._can_hot_swap_audio(),
+            "user_title": self.user_title,
+        }
+
+    async def _apply_settings_patch(self, patch: dict[str, Any]) -> None:
+        errors: list[str] = []
+        restart_vad = False
+        store_patch: dict[str, Any] = {}
+
+        if "voice_id" in patch and patch["voice_id"]:
+            self.voice_settings.apply(voice_id=str(patch["voice_id"]))
+            store_patch["voice_id"] = self.voice_settings.runtime.voice_id
+            await self._sync_tts_from_voice_settings()
+
+        if "speed" in patch and patch["speed"] is not None:
+            self.voice_settings.apply(speed=float(patch["speed"]))
+            store_patch["speed"] = self.voice_settings.runtime.speed
+            await self._sync_tts_from_voice_settings()
+
+        if "audio_profile" in patch and patch["audio_profile"] is not None:
+            choice = str(patch["audio_profile"]).strip()
+            if choice not in ("auto", "board", "fy_sp701"):
+                errors.append("invalid_audio_profile")
+            elif not self._can_hot_swap_audio():
+                errors.append("busy")
+            else:
+                store_patch["audio_profile"] = choice
+                self.audio_profile.switch_active(choice)
+                saved = self.user_settings.load()
+                self.audio_profile.apply_user_overrides(
+                    usb_mic_volume=saved.usb_mic_volume,
+                    speaker_volume=saved.speaker_volume,
+                    vad=saved.vad or None,
+                )
+                self.audio_profile.apply_to_vad(self.vad_config)
+                self.audio_profile.apply_usb_mixer()
+                await self._sync_tts_from_voice_settings()
+                restart_vad = True
+                await self.emit(
+                    {
+                        "type": "audio_profile",
+                        "profile_id": self.audio_profile.active.profile_id,
+                        "label": self.audio_profile.active.label,
+                        "capture_device": self.audio_profile.active.capture_device,
+                        "play_script": self.audio_profile.active.play_script,
+                    }
+                )
+
+        if "user_title" in patch and patch["user_title"] is not None:
+            await self._set_user_title(str(patch["user_title"]).strip()[:8])
+
+        if "usb_mic_volume" in patch and patch["usb_mic_volume"] is not None:
+            vol = max(0, min(24660, int(patch["usb_mic_volume"])))
+            store_patch["usb_mic_volume"] = vol
+            self.audio_profile.apply_user_overrides(usb_mic_volume=vol)
+            self.audio_profile.apply_usb_mixer()
+
+        if "speaker_volume" in patch and patch["speaker_volume"] is not None:
+            pct = max(0, min(100, int(patch["speaker_volume"])))
+            store_patch["speaker_volume"] = pct
+            self.audio_profile.apply_user_overrides(speaker_volume=pct)
+            self.audio_profile.apply_usb_mixer()
+            self.tts_queue.engine.set_playback_env(self.audio_profile.playback_env())
+
+        if "vad" in patch and isinstance(patch["vad"], dict):
+            store_patch["vad"] = patch["vad"]
+            self.audio_profile.apply_user_overrides(vad=patch["vad"])
+            self.audio_profile.apply_to_vad(self.vad_config)
+            if self._can_hot_swap_audio():
+                restart_vad = True
+
+        if store_patch:
+            self.user_settings.patch(store_patch)
+
+        if restart_vad:
+            self._vad_restart.set()
+
+        snap = await self._build_settings_snapshot()
+        await self.emit(
+            {
+                "type": "settings_applied",
+                "ok": not errors,
+                "errors": errors,
+                "restart_vad": restart_vad,
+                **{k: v for k, v in snap.items() if k != "type"},
+            }
+        )
+
+    async def run_vad_loop(self, inject_wav: str | None = None) -> None:
+        try:
+            while True:
+                while self._debug_vad_paused:
+                    await asyncio.sleep(0.25)
+                if inject_wav:
+                    await self.vad_stream.run_wav_file(inject_wav)
+                    break
+                self.vad_stream = VadStream(self.vad_config, self.vad_queue)
+                live_task = asyncio.create_task(self.vad_stream.run_live())
+                restart_task = asyncio.create_task(self._vad_restart.wait())
+                done, pending = await asyncio.wait(
+                    [live_task, restart_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                if self._vad_restart.is_set():
+                    self._vad_restart.clear()
+                    self.vad_stream.stop()
+                    with contextlib.suppress(Exception):
+                        await live_task
+                    LOG.info("[settings] VAD restarted after audio settings change")
+                    continue
+                if live_task.done():
+                    with contextlib.suppress(Exception):
+                        await live_task
+                    LOG.warning("[vad] capture stopped — retry in 3s")
+                    await asyncio.sleep(3)
+                    continue
+                LOG.error("[vad] unexpected loop exit — retry in 3s")
+                await asyncio.sleep(3)
+        finally:
+            if not self._debug_vad_paused:
+                await self.vad_queue.put({"type": "shutdown"})
+
+    async def _turn_worker(self) -> None:
+        while True:
+            event = await self._turn_queue.get()
+            try:
+                if event is None:
+                    LOG.info("[turn] worker shutdown")
+                    return
+                await self._process_turn(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("[turn] processing failed")
+                self._speaking = False
+                self._tts_abort = False
+                self.set_state(AgentState.LISTEN)
+                await self.emit({"type": "error", "code": "turn_failed"})
+            finally:
+                self._turn_queue.task_done()
+
+    async def _enqueue_turn(self, event: dict[str, Any]) -> None:
+        """Keep the newest speech turns instead of answering an obsolete backlog."""
+        event.setdefault("_vad_end_at", time.monotonic())
+        dropped = 0
+        while self._turn_queue.full():
+            stale = self._turn_queue.get_nowait()
+            self._turn_queue.task_done()
+            if stale is None:
+                await self._turn_queue.put(None)
+                return
+            dropped += 1
+        if dropped:
+            LOG.info("[turn] dropped %d stale queued segment(s)", dropped)
+        await self._turn_queue.put(event)
+
+    async def handle_events(self) -> None:
+        self.set_state(AgentState.LISTEN)
+        while True:
+            event = await self.vad_queue.get()
+            etype = event.get("type")
+            if etype == "shutdown":
+                LOG.warning("[event] shutdown signal — restarting event loop")
+                self.set_state(AgentState.LISTEN)
+                return
+            if etype == "error":
+                LOG.error("[event] %s", event)
+                continue
+            if self.mute_mic_during_tts and self._speaking:
+                # Completely block all mic events while TTS is playing —
+                # cancels in-flight ASR and drops audio_chunk so NPU does not
+                # waste cycles transcribing the speaker's own echo.
+                if etype in ("speech_start", "audio_chunk"):
+                    if self._asr_session:
+                        await self._asr_session.cancel()
+                        self._asr_session = None
+                    LOG.debug("[vad] mute_mic: blocked %s during TTS playback", etype)
+                    continue
+                if etype == "speech_end":
+                    LOG.debug("[vad] mute_mic: blocked speech_end during TTS playback")
+                    continue
+                # audio_segment is handled below (echo-time-window check)
+            if etype == "speech_start":
+                if self._turn_busy and not self._speaking:
+                    LOG.debug("[vad] ignore speech start while ASR/LLM owns recognizer")
+                    continue
+                LOG.info("[event] speech_start")
+                self._new_asr_session()
+                await self._asr_session.start()
+                continue
+            if etype == "speech_end":
+                LOG.info("[event] speech_end")
+                continue
+            if etype == "audio_chunk" and self._asr_session and (not self._turn_busy or self._speaking):
+                await self._asr_session.feed(event["samples"])
+                continue
+            if etype == "audio_segment":
+                duration = float(event.get("duration_sec", 0.0))
+                if self.mute_mic_during_tts:
+                    end_at = float(event.get("end_at") or time.monotonic())
+                    start_at = end_at - duration
+                    if start_at < (getattr(self, "_last_tts_end_at", 0.0) or 0.0):
+                        LOG.info("[vad] mute_mic_during_tts: dropped playback echo segment (%.2fs)", duration)
+                        continue
+                if self._speaking:
+                    if duration >= self.barge_in_min_sec:
+                        LOG.info("[vad] speaking turn, queuing potential user speech (%.2fs)", duration)
+                        await self._enqueue_turn(event)
+                    continue
+                if self._turn_busy and not self._speaking and not self._tts_abort:
+                    if duration >= 0.8:
+                        LOG.info("[vad] busy turn, but segment is valid user speech (%.2fs), queuing", duration)
+                        await self._enqueue_turn(event)
+                        continue
+                    LOG.info("[vad] busy ASR/LLM, drop %.2fs segment", duration)
+                    continue
+                if (
+                    not self._speaking
+                    and time.monotonic() < self._listen_cooldown_until
+                    and duration < self.listen_cooldown_skip_max_sec
+                ):
+                    LOG.info("[vad] post-tts cooldown, skip short %.2fs segment", duration)
+                    continue
+                await self._enqueue_turn(event)
+        await self._turn_queue.put(None)
+
+    async def _process_turn(self, event: dict[str, Any]) -> None:
+        # The new turn (generation bump, TTS queue reset) only starts once ASR says this
+        # is real user speech. Starting it up front let a speaker echo picked up during
+        # playback cancel the reply being spoken, even though it was then dropped as echo.
+        was_speaking = self._speaking
+        started_turn = False
+        self._turn_busy = True
+        duration = event.get("duration_sec", 0.0)
+        LOG.info("[event] audio_segment %.2fs", duration)
+        # not marked as owner activity here: any noise in the room makes a segment; see _llm_turn
+        if not was_speaking:
+            self.set_state(AgentState.ASR)
+        session = self._asr_session
+        try:
+            if not session:
+                session = self._new_asr_session()
+                await session.start()
+            result = await session.finalize_samples(event["samples"])
+            raw_text, creds = extract_credentials((result.get("text") or "").strip())  # before normalizing mangles it
+            if creds:
+                self._pending_creds = creds
+            text = normalize_user_text(raw_text)
+            if text:
+                LOG.info("[asr] normalized: %s", text)
+                recent_tts = self._speaking or (time.monotonic() - getattr(self, "_last_tts_end_at", 0.0) < 2.0)
+                cur_speak = (
+                    (getattr(self, "_last_ack_text", "") or "")
+                    + " "
+                    + (getattr(self, "_active_tts_text", "") or "")
+                    + " "
+                    + (getattr(self, "_last_spoken_turn", "") or "")
+                ).strip()
+                if recent_tts and cur_speak and is_self_echo(cur_speak, text):
+                    LOG.warning(
+                        "[asr] detected acoustic echo of assistant speech ('%s' in '%s'), dropping loop",
+                        text,
+                        cur_speak[:30],
+                    )
+                    return
+                core = normalize_spoken_text(text)
+                if was_speaking and (len(core) <= 1 or set(core) <= set("啊嗯呃哦呀吧呵哈嘿好")):
+                    # "好"/"嗯" heard mid-reply is almost always our own ack/echo; starting a
+                    # turn for it would cancel the reply that is still being spoken.
+                    LOG.info("[asr] ignored filler while speaking: %s", text)
+                    return
+                self._next_turn_id += 1
+                generation = self._next_turn_id
+                self._active_turn_id = generation
+                self._tts_abort = False
+                self.tts_queue.mark_utterance_start(generation)
+                started_turn = True
+                await self._run_llm(
+                    text,
+                    generation=generation,
+                    vad_end_at=float(event.get("_vad_end_at", time.monotonic())),
+                )
+            else:
+                LOG.info("[asr] no text recognized")
+        finally:
+            if self._asr_session is session:
+                self._asr_session = None
+            self._turn_busy = False
+            # A dropped echo/empty segment must not unmute the mic or reset the state
+            # while another turn (e.g. WebSocket chat) is still speaking.
+            if started_turn or not was_speaking:
+                self._speaking = False
+                self.set_state(AgentState.LISTEN)
+
+    async def _enqueue_speak(
+        self,
+        text: str,
+        tts_state: dict[str, Any],
+        *,
+        generation: int,
+    ) -> bool | None:
+        if self._tts_abort or generation != self._active_turn_id:
+            return False
+        speak = sanitize_tts_text(text)
+        if not is_speakable(speak):
+            return False
+        spoken_key = normalize_spoken_text(speak)
+        spoken_keys: set[str] = tts_state.setdefault("spoken_keys", set())
+        if spoken_key and spoken_key in spoken_keys:
+            LOG.warning("[llm] suppressed repeated streamed clause: %s", speak[:60])
+            return None
+        if spoken_key:
+            spoken_keys.add(spoken_key)
+        tts_state["n"] = int(tts_state["n"]) + 1
+        spoken_texts: list[str] = tts_state.setdefault("spoken_texts", [])
+        spoken_texts.append(speak)
+        if self.state != AgentState.TTS:
+            self.set_state(AgentState.TTS)
+        self._speaking = True
+        LOG.info("[event] tts_sentence: %s", speak[:60])
+        await self.emit({"type": "tts_sentence", "text": speak})
+        await self.tts_queue.enqueue(speak, generation=generation)
+        return True
+
+    async def _speak_extracted(self, full: str, *, canned: bool = False, generation: int) -> None:
+        """Enqueue every complete sentence in full — no char/sentence cap."""
+        tts_state: dict[str, Any] = {"n": 0, "canned": canned, "spoken_keys": set(), "spoken_texts": []}
+        sents = extract_speak_sentences(full, max_cjk=99999)
+        if not sents:
+            return
+        LOG.info("[tts] speak plan: %d sentence(s)", len(sents))
+        self._active_tts_text = full
+        self._last_spoken_turn = full
+        for sent in sents:
+            for clause in split_tts_clauses(sent):
+                if (await self._enqueue_speak(clause, tts_state, generation=generation)) is False:
+                    break
+        if int(tts_state["n"]) <= 0 or self._tts_abort:
+            return
+        self.set_state(AgentState.TTS)
+        self._speaking = True
+        try:
+            await self.tts_queue.wait_done(generation=generation)
+        finally:
+            self._speaking = False
+            self._last_tts_end_at = time.monotonic()
+        if not self._tts_abort:
+            self._listen_cooldown_until = time.monotonic() + self.listen_cooldown_sec
+        lat = self.tts_queue.first_play_latency_s
+        if lat is not None:
+            LOG.info("[tts] utterance first_play=%.2fs (target <4s)", lat)
+
+    async def _prepare_llm_call(self) -> None:
+        now = time.monotonic()
+        if self._chat_turns and self.history_idle_clear_sec > 0:
+            idle = now - self._llm_last_turn_at
+            if idle >= self.history_idle_clear_sec:
+                LOG.info(
+                    "[llm] idle %.0fs >= %.0fs, clearing transcript",
+                    idle,
+                    self.history_idle_clear_sec,
+                )
+        try:
+            await asyncio.to_thread(llm_clear_history, self.socket_path)
+        except Exception as exc:
+            LOG.debug("[llm] clear history skipped: %s", exc)
+
+    @staticmethod
+    def _datetime_context() -> str:
+        """Return a compact Chinese datetime context string for the system prompt."""
+        import datetime
+        _WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        now = datetime.datetime.now()
+        weekday = _WEEKDAYS[now.weekday()]
+        hour = now.hour
+        if hour < 6:
+            period = "凌晨"
+        elif hour < 12:
+            period = "上午"
+        elif hour == 12:
+            period = "中午"
+        elif hour < 18:
+            period = "下午"
+        else:
+            period = "晚上"
+        h12 = hour % 12 or 12
+        agenda = ""
+        try:   # the owner's timetable from the 主人 tab (learning/inbox.py): the next few items today
+            import os
+            from learning.inbox import today_events
+            owner_dir = Path(os.environ.get("AGENT_ROOT", "/userdata/agent")) / "run" / "learning" / "owner"
+            hm = f"{hour:02d}:{now.minute:02d}"
+            nxt = [e for e in today_events(owner_dir, now.date()) if (e.get("end") or e.get("start") or "99") >= hm][:3]
+            if nxt:
+                agenda = "主人今天还有：" + "；".join(f"{e.get('start', '')} {e['title']}" + (f"（{e['place']}）" if e.get("place") else "")
+                                               for e in nxt) + "。"
+        except Exception:  # noqa: BLE001 - no timetable is fine
+            agenda = ""
+        return (
+            f"当前时间：{now.year}年{now.month}月{now.day}日，{weekday}，"
+            f"{period}{h12}点{now.minute:02d}分。{agenda}"
+        )
+
+    def _system_body(self, memory_ctx: str = "") -> str:
+        sys_body = apply_title((self.system_prompt or "").strip(), getattr(self, "user_title", DEFAULT_TITLE), for_prompt=True)
+        voice_block = self.voice_settings.describe_for_prompt() if hasattr(self, "voice_settings") and self.voice_settings else ""
+        if voice_block:
+            sys_body = f"{sys_body}\n\n{voice_block}".strip()
+        if sys_body:   # the rules she wrote for herself about talking (learning.selftune keeps them)
+            sys_body = selfprompt.apply(sys_body, "voice")
+        if memory_ctx:
+            sys_body = f"{sys_body}\n\n{apply_title(memory_ctx, getattr(self, 'user_title', DEFAULT_TITLE), for_prompt=True)}"
+        if not sys_body:
+            return ""
+        # Prepend live datetime so model can answer time/date questions correctly
+        return f"{self._datetime_context()}\n{sys_body}"
+
+    def _history_for_prompt(self, sys_text: str, user_text: str) -> list[tuple[str, str]]:
+        """The last turns (whoever answered them: local model, teacher, agent, memory) that fit the local
+        model's small context. Answers are clipped; the oldest turns go first when the budget runs out."""
+        n = getattr(self, "history_max_turns", 0)
+        if n <= 0:
+            return []
+        budget = (getattr(self, "llm_context_tokens", 768) - getattr(self, "max_new_tokens", 200)
+                  - _est_tokens(sys_text) - _est_tokens(user_text) - 24)
+        picked: list[tuple[str, str]] = []
+        for t in reversed(getattr(self, "_recent", [])[-n:]):
+            q, a = _clip(t["q"], 40), _clip(t["a"], 70)
+            cost = _est_tokens(q) + _est_tokens(a) + 12  # + the chat-template tokens around them
+            if cost > budget:
+                break
+            budget -= cost
+            picked.append((q, a))
+        return list(reversed(picked))
+
+    def _build_llm_prompt(self, user_text: str, memory_ctx: str = "") -> str:
+        prompt = ""
+        sys_text = self._system_body(memory_ctx)
+        if sys_text:
+            prompt += f"<|im_start|>system\n{sys_text}<|im_end|>\n"
+        history = self._history_for_prompt(sys_text, user_text)
+        self._last_history_turns = len(history)
+        for user, assistant in history:
+            prompt += f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{assistant}<|im_end|>\n"
+        prompt += f"<|im_start|>user\n{user_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+        return prompt
+
+    def _reply_hit_segment_limit(self, reply: dict) -> bool:
+        return reply.get("finish_reason") == "length"
+
+    def _mark_activity(self) -> None:
+        """Owner just talked/typed (or the agent is busy): background practice (learning/practice.py) waits."""
+        root = getattr(self, "agent_root", None)
+        if root is None:
+            return
+        try:
+            path = root / "run" / "last_activity"
+            path.touch()
+            os.utime(path, None)
+        except OSError:
+            pass
+
+    def _push_recent(self, question: str, answer: str, who: str) -> None:
+        turns = getattr(self, "_recent", None)
+        if turns is not None and question and answer:
+            turns.append({"q": question, "a": answer, "who": who})
+            del turns[:-8]
+
+    def _journal(self, question: str, answer: str, who: str, reason: str = "", *, recent: bool = True) -> None:
+        journal_dir = getattr(self, "journal_dir", None)
+        if journal_dir is not None:
+            log_turn(journal_dir, question, answer, who=who, reason=reason)
+        if recent:
+            self._push_recent(question, answer, who)
+
+    def _record_chat_turn(self, user: str, assistant: str) -> None:
+        if self.history_max_turns <= 0:
+            self._chat_turns.clear()
+            return
+        text = clean_llm_reply(user, (assistant or "").strip())
+        if not text:
+            return
+        if self._chat_turns and self._chat_turns[-1][1].strip() == text:
+            LOG.warning("[llm] repetition detected in record_turn, wiping history")
+            self._chat_turns.clear()
+            return
+        self._chat_turns.append((user, text))
+        if len(self._chat_turns) > self.history_max_turns:
+            self._chat_turns = self._chat_turns[-self.history_max_turns :]
+        self._llm_last_turn_at = time.monotonic()
+        LOG.info("[llm] transcript stored (%d/%d turns)", len(self._chat_turns), self.history_max_turns)
+
+    async def _emit_reply_final(self, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            await self.emit({"type": "reply_final", "text": text})
+
+    async def _speak_turn(self, text: str, *, generation: int = 0) -> None:
+        await self._emit_reply_final(text)
+        await self._speak_extracted(text, canned=True, generation=generation)
+
+    def _grab_rtsp_frame(self, url: str, save_path: Path, timeout: float = 3.0) -> bool:
+        from orchestrator.rtsp_frame import grab_rtsp_frame
+
+        transport = getattr(self, "camera_rtsp_transport", "tcp") or "tcp"
+        size = int(getattr(self, "camera_size", 448))
+        return grab_rtsp_frame(
+            url,
+            save_path,
+            timeout=max(float(timeout), 12.0),
+            transport=transport,
+            size=size,
+        )
+
+    def _uses_mediamtx_grab(self) -> bool:
+        return uses_mediamtx(getattr(self, "mediamtx_cfg", MediamtxCameraConfig()))
+
+    def _mediamtx_cache_fresh(self) -> bool:
+        cfg = getattr(self, "mediamtx_cfg", None)
+        return bool(cfg) and mediamtx_cache_fresh(cfg)
+
+    def _sync_preview_from_mediamtx_cache(self) -> bool:
+        """WebUI preview: latest mediamtx_latest.jpg → ui/latest_frame.jpg."""
+        if not self._uses_mediamtx_grab():
+            return False
+        ui_path = self.agent_root / "ui" / "latest_frame.jpg"
+        if not copy_mediamtx_cache_file(self.mediamtx_cfg, ui_path):
+            return False
+        try:
+            data = ui_path.read_bytes()
+            self._latest_camera_bytes = data
+            self._latest_camera_time = time.monotonic()
+        except OSError:
+            return False
+        return True
+
+    def _grab_and_prepare_vlm_frame(
+        self,
+        raw_path: Path,
+        vlm_path: Path,
+        *,
+        timeout: float | None = None,
+        force_live: bool = False,
+        cache_only: bool = False,
+    ) -> tuple[bool, str]:
+        """Grab + 448 prep for InternVL see. Returns (ok, source tag)."""
+        t_out = float(timeout if timeout is not None else self.camera_timeout)
+        size = int(getattr(self, "camera_size", 448))
+        if self._uses_mediamtx_grab():
+            cfg = self.mediamtx_cfg
+            ok, src = grab_mediamtx_vlm_pair(
+                cfg,
+                raw_path,
+                vlm_path,
+                timeout=t_out,
+                size=size,
+                force_live=force_live,
+                cache_only=cache_only,
+            )
+            if ok and vlm_path.is_file():
+                data = vlm_path.read_bytes()
+                self._latest_camera_bytes = data
+                self._latest_camera_time = time.monotonic()
+                self._sync_ui_preview_frame(data)
+            return ok, src
+        ok = self._grab_camera_frame(self.camera_url, raw_path, timeout=t_out, max_cache_age_sec=0.0)
+        if not ok:
+            return False, "miss"
+        prep = self._prepare_vlm_frame(raw_path, vlm_path, size=size)
+        return prep, "rtsp_direct" if prep else "miss"
+
+    def _vision_prefers_scene_memory_only(self, user_prompt: str) -> bool:
+        """Activity-style questions can answer from memory; desk/object queries need see."""
+        if any(k in user_prompt for k in ("重新", "重看", "再看", "刷新", "拍张照", "拍个照")):
+            return False
+        if any(k in user_prompt for k in ("干什么", "干嘛", "做什么", "在干", "在做")):
+            return True
+        if self._uses_mediamtx_grab():
+            return False
+        return bool(str(getattr(self, "_scene_memory", {}).get("caption", "")).strip())
+
+    def _sync_ui_preview_frame(self, data: bytes) -> None:
+        try:
+            if not preview_jpeg_bytes_valid(data):
+                return
+            ui_frame_path = self.agent_root / "ui" / "latest_frame.jpg"
+            ui_frame_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = ui_frame_path.with_suffix(".part.jpg")
+            tmp.write_bytes(data)
+            tmp.replace(ui_frame_path)
+        except Exception:
+            pass
+
+    def _grab_camera_frame(
+        self,
+        url: str,
+        save_path: Path,
+        timeout: float = 2.0,
+        max_cache_age_sec: float = 3.0,
+    ) -> bool:
+        try:
+            now = time.monotonic()
+            grab_backend = getattr(self, "camera_grab_backend", "rtsp")
+            if grab_backend.startswith("mediamtx") or grab_backend == "whep":
+                mtx = getattr(self, "mediamtx_cfg", None)
+                if mtx and mediamtx_cache_fresh(mtx):
+                    latest = Path(mtx.latest_frame)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    data = latest.read_bytes()
+                    save_path.write_bytes(data)
+                    self._latest_camera_bytes = data
+                    self._latest_camera_time = now
+                    self._sync_ui_preview_frame(data)
+                    LOG.info(
+                        "[camera] mediamtx latest_frame hit (age=%.2fs, %d bytes)",
+                        mediamtx_cache_age_sec(mtx) or 0,
+                        len(data),
+                    )
+                    return True
+            # 1. Zero-wait in-memory cache hit
+            if (
+                self._latest_camera_bytes
+                and (now - self._latest_camera_time) <= max_cache_age_sec
+            ):
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(self._latest_camera_bytes)
+                LOG.info(
+                    "[camera] zero-wait: used in-memory frame (age=%.2fs, size=%d bytes)",
+                    now - self._latest_camera_time,
+                    len(self._latest_camera_bytes),
+                )
+                self._sync_ui_preview_frame(self._latest_camera_bytes)
+                return True
+
+            data: bytes | None = None
+            if grab_backend.startswith("mediamtx") or grab_backend == "whep":
+                from orchestrator.mediamtx_camera import grab_mediamtx_frame
+
+                size = int(getattr(self, "camera_size", 448))
+                mtx = getattr(self, "mediamtx_cfg", None)
+                if mtx and grab_mediamtx_frame(mtx, save_path, timeout=timeout, size=size):
+                    data = save_path.read_bytes()
+                    LOG.info("[camera] mediamtx grab ok (%d bytes) backend=%s", len(data), grab_backend)
+            elif url.startswith("rtsp://"):
+                ok = False
+                try:
+                    self.brain.grab_frame(save_path, rtsp_url=url)
+                    if save_path.is_file() and save_path.stat().st_size > 1000:
+                        ok = True
+                        data = save_path.read_bytes()
+                        LOG.info("[camera] grab_camera_frame ok (%d bytes)", len(data))
+                except Exception as exc:
+                    LOG.warning("[camera] grab_camera_frame failed: %s", exc)
+                if not ok:
+                    ok = self._grab_rtsp_frame(url, save_path, timeout=timeout)
+                    if ok and save_path.is_file():
+                        data = save_path.read_bytes()
+            elif os.path.exists(url):
+                import shutil
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(url, save_path)
+                data = save_path.read_bytes()
+            else:
+                target_url = url.rstrip("/")
+                if not target_url.startswith("file://"):
+                    if not target_url.endswith(".jpg") and not target_url.endswith(".jpeg"):
+                        target_url += "/shot.jpg"
+                req = urllib.request.Request(
+                    target_url,
+                    headers={"User-Agent": "XiaoLan-CameraClient/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = resp.read()
+                if data:
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    save_path.write_bytes(data)
+
+            if not data:
+                return False
+
+            self._latest_camera_bytes = data
+            self._latest_camera_time = now
+            self._sync_ui_preview_frame(data)
+            return True
+        except Exception as exc:
+            LOG.warning("[camera] grab frame from %s failed: %s", url, exc)
+            return False
+
+    def _prepare_vlm_frame(self, src_path: Path, dst_path: Path, size: int = 448) -> bool:
+        try:
+            from PIL import Image
+            im = Image.open(src_path).convert("RGB")
+            w, h = im.size
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            cropped = im.crop((left, top, left + side, top + side))
+            resized = cropped.resize((size, size), Image.BILINEAR)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            resized.save(dst_path, format="JPEG", quality=92)
+            return True
+        except Exception as exc:
+            LOG.warning("[camera] prepare frame failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _compute_frame_motion(img_a: Any, img_b: Any) -> float:
+        try:
+            thumb_a = img_a.resize((64, 64)).convert("L")
+            thumb_b = img_b.resize((64, 64)).convert("L")
+            bytes_a = thumb_a.tobytes()
+            bytes_b = thumb_b.tobytes()
+            diff = sum(abs(a - b) for a, b in zip(bytes_a, bytes_b)) / len(bytes_a)
+            return float(diff)
+        except Exception:
+            return 0.0
+
+    async def _proactive_companion_loop(self) -> None:
+        """Jarvis proactive companion: observe motion & provide emotional companionship."""
+        if not self.camera_enabled or not getattr(self, "proactive_enabled", True):
+            LOG.info("[companion] proactive companion loop disabled")
+            return
+
+        LOG.info("[companion] proactive companion loop started (interval=%.1fs, threshold=%.1f, cooldown=%.1fs)",
+                 self.proactive_interval_sec, self.proactive_motion_threshold, self.proactive_cooldown_sec)
+
+        from PIL import Image
+        temp_dir = self.agent_root / "run"
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            temp_dir = Path("/tmp")
+        raw_shot_path = temp_dir / "camera_proactive_raw.jpg"
+
+        last_img: Any = None
+
+        while True:
+            try:
+                await asyncio.sleep(self.proactive_interval_sec)
+
+                # Skip if agent is currently speaking, busy, or listening to user speech
+                if self._speaking or self._turn_busy or self.state not in (AgentState.IDLE, AgentState.LISTEN):
+                    continue
+
+                # Run camera grab in thread
+                grab_ok = await asyncio.to_thread(
+                    self._grab_camera_frame, self.camera_url, raw_shot_path, self.camera_timeout
+                )
+                if not grab_ok or not raw_shot_path.exists():
+                    continue
+
+                def _load_and_diff(p: Path, prev: Any) -> tuple[Any, float]:
+                    cur = Image.open(p).convert("RGB")
+                    m = Orchestrator._compute_frame_motion(prev, cur) if prev is not None else 0.0
+                    return cur, m
+
+                cur_img, motion = await asyncio.to_thread(_load_and_diff, raw_shot_path, last_img)
+                last_img = cur_img
+                await self.emit({"type": "camera_frame", "motion": round(motion, 2), "timestamp": time.time()})
+
+                now = time.monotonic()
+                if motion > 1.5:
+                    LOG.debug("[companion] motion index: %.2f (thresh=%.1f, cooldown_rem=%.0fs)",
+                              motion, self.proactive_motion_threshold,
+                              max(0.0, self.proactive_cooldown_sec - (now - self._last_proactive_speak_at)))
+
+                if (
+                    motion >= self.proactive_motion_threshold
+                    and (now - self._last_proactive_speak_at >= self.proactive_cooldown_sec)
+                    and not self._speaking
+                    and not self._turn_busy
+                ):
+                    self._last_proactive_speak_at = now
+                    LOG.info("[companion] motion detected (%.2f >= %.2f), triggering proactive interaction",
+                             motion, self.proactive_motion_threshold)
+
+                    # Dynamic Jarvis prompt based on time of day
+                    import datetime
+                    hr = datetime.datetime.now().hour
+                    if hr < 6:
+                        time_cue = "深夜仍未休息"
+                        style_cue = "以顶级私人管家的沉稳从容口吻，适度调侃睡眠与维护的重要性，并极具温度地劝主人保重身体早点休息。"
+                    elif hr < 12:
+                        time_cue = "上午专注投入"
+                        style_cue = "以顶级私人管家的沉稳优雅口吻，肯定主人的专注力，并贴心提醒活动肩颈或准备一杯热饮。"
+                    elif hr < 18:
+                        time_cue = "下午高强度工作"
+                        style_cue = "以顶级私人管家温和从容又带点风趣的口吻，提醒适时补充水分并赞许主人的工作节奏。"
+                    else:
+                        time_cue = "晚上持续奋战"
+                        style_cue = "以顶级私人管家温和忠诚的语气，给予主人坚定的陪伴感与情绪支持，提醒注意劳逸结合。"
+
+                    proactive_prompt = (
+                        f"主人正在面前操作设备或打字敲键盘，当前处于{time_cue}状态。"
+                        f"请{style_cue}用一句极简自然、充满忠诚陪伴感的纯中文口语直接向主人表达关心。严禁出现任何角色名、电影名或英文，不超过二十五个汉字。"
+                    )
+
+                    self._next_turn_id += 1
+                    generation = self._next_turn_id
+                    self._active_turn_id = generation
+                    self._turn_busy = True
+                    self._tts_abort = False
+                    self.tts_queue.mark_utterance_start(generation)
+                    try:
+                        await self._run_llm(proactive_prompt, generation=generation, vad_end_at=now, is_companion=True)
+                    finally:
+                        self._turn_busy = False
+
+            except asyncio.CancelledError:
+                LOG.info("[companion] proactive companion loop cancelled")
+                break
+            except Exception as exc:
+                LOG.warning("[companion] exception in proactive loop: %s", exc)
+                await asyncio.sleep(self.proactive_interval_sec)
+
+    async def _handle_ws_message(self, raw_msg: str) -> None:
+        try:
+            data = json.loads(raw_msg)
+        except Exception:
+            return
+        mtype = str(data.get("type", "")).strip().lower()
+        if mtype == "settings_get":
+            await self.emit(await self._build_settings_snapshot())
+        elif mtype == "settings_set":
+            await self._apply_settings_patch(data.get("patch") or {})
+        elif mtype == "debug_get":
+            snap = await asyncio.to_thread(build_debug_snapshot, self)
+            snap["text"] = format_debug_snapshot(snap)
+            await self.emit(snap)
+        elif mtype == "debug_audio":
+            result = await handle_debug_audio(self, data)
+            result["type"] = "debug_audio_result"
+            result.update(self.debug_audio.status())
+            await self.emit(result)
+        elif mtype in ("chat", "user_message"):
+            text = str(data.get("text", "")).strip()
+            if text:
+                asyncio.create_task(self._handle_direct_chat(text))
+        elif mtype in ("snap", "capture"):
+            prompt = str(data.get("prompt", "桌面上有什么？")).strip()
+            asyncio.create_task(self._handle_manual_snap(user_prompt=prompt))
+        elif mtype in ("set_camera_url", "update_camera"):
+            url = str(data.get("url", "")).strip()
+            if url:
+                if "transport" in data:
+                    self.camera_rtsp_transport = str(data.get("transport", "tcp")).strip()
+                asyncio.create_task(self._apply_camera_url_change(url))
+        elif mtype in ("get_status", "status", "ping"):
+            await self._broadcast_status()
+        elif mtype == "agent_approve":
+            fut = getattr(self, "_agent_pending", {}).get(str(data.get("id", "")))
+            if fut is not None and not fut.done():
+                fut.set_result(("always" if data.get("remember") else "task" if data.get("task") else "once")
+                               if data.get("ok") else "deny")
+        elif mtype in ("stop", "abort", "tts_abort"):
+            await self._abort_tts_playback()
+            self.set_state(AgentState.LISTEN)
+
+    async def _abort_tts_playback(self) -> None:
+        self._tts_abort = True
+        if hasattr(self, "tts_queue") and self.tts_queue is not None:
+            if hasattr(self.tts_queue, "abort"):
+                try:
+                    res = self.tts_queue.abort()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+            elif hasattr(self.tts_queue, "interrupt"):
+                try:
+                    await self.tts_queue.interrupt()
+                except Exception:
+                    pass
+
+    async def _handle_direct_chat(self, text: str) -> None:
+        self._mark_activity()
+        self._next_turn_id += 1
+        generation = self._next_turn_id
+        self._active_turn_id = generation
+        self._turn_busy = True
+        await self._abort_tts_playback()
+        self._tts_abort = False
+        if hasattr(self.tts_queue, "mark_utterance_start"):
+            self.tts_queue.mark_utterance_start(generation)
+        try:
+            text, creds = extract_credentials(text)  # before normalizing mangles it
+            if creds:
+                self._pending_creds = creds
+            clean_text = normalize_user_text(text)
+            if clean_text:
+                await self.emit({"type": "asr_final", "text": clean_text, "generation": generation, "source": "web"})
+                if self.camera_enabled and self.brain.wants_vision(clean_text):
+                    LOG.info("[web] vision intent: %s", clean_text[:48])
+                    await self._handle_vision_turn(clean_text, generation=generation)
+                else:
+                    await self._run_llm(clean_text, generation=generation, vad_end_at=time.monotonic())
+        finally:
+            self._turn_busy = False
+            self.set_state(AgentState.LISTEN)
+
+    async def _handle_manual_snap(self, user_prompt: str = "桌面上有什么？") -> None:
+        run_dir = self.agent_root / "run"
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            run_dir = Path("/tmp")
+        raw_shot_path = run_dir / "camera_shot.jpg"
+        vlm_frame_path = run_dir / "latest_vlm.jpg"
+
+        await self.emit({"type": "vision_start", "query": user_prompt, "generation": 0})
+        success, caption = False, ""
+        ok, _src = await asyncio.to_thread(
+            self._grab_and_prepare_vlm_frame,
+            raw_shot_path,
+            vlm_frame_path,
+            cache_only=self._uses_mediamtx_grab(),
+        )
+        if ok:
+            await self.emit(
+                {"type": "camera_frame", "motion": 0, "timestamp": time.time(), "grab_source": _src}
+            )
+            caption = await self._board_vlm_with_web_tokens(
+                vlm_frame_path, user_prompt, generation=0
+            )
+            success = True
+        if success and caption:
+            self._save_scene_memory(caption)
+            await self.emit({"type": "vision_caption", "caption": caption, "generation": 0, "url": "/latest_frame.jpg"})
+        else:
+            await self.emit({"type": "vision_error", "error": "camera_unreachable", "generation": 0})
+
+    def _update_mediamtx_rtsp_upstream(self, rtsp_url: str) -> None:
+        """Point mediamtx pull at a new camera RTSP URL (WebUI stream switch)."""
+        p4 = Path("/userdata/p4")
+        env_path = p4 / "config" / "rtsp.env"
+        if not env_path.is_file():
+            LOG.warning("[camera] no %s — cannot switch mediamtx upstream", env_path)
+            return
+        lines: list[str] = []
+        replaced = False
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip().startswith("RTSP_URL="):
+                lines.append(f"RTSP_URL={rtsp_url}")
+                replaced = True
+            else:
+                lines.append(line)
+        if not replaced:
+            lines.append(f"RTSP_URL={rtsp_url}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        gen = p4 / "scripts" / "mediamtx_gen_config.sh"
+        if gen.is_file():
+            subprocess.run(["bash", str(gen)], check=False, timeout=30)
+        subprocess.run(["pkill", "-x", "mediamtx"], check=False)
+        time.sleep(1)
+        mtx_bin = p4 / "bin" / "mediamtx"
+        mtx_cfg = p4 / "config" / "mediamtx.yml"
+        if mtx_bin.is_file() and mtx_cfg.is_file():
+            subprocess.Popen(
+                [str(mtx_bin), str(mtx_cfg)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        cache = Path(getattr(self.mediamtx_cfg, "latest_frame", "/userdata/agent/run/mediamtx_latest.jpg"))
+        try:
+            cache.unlink(missing_ok=True)
+        except OSError:
+            pass
+        LOG.info("[camera] mediamtx upstream -> %s (cache cleared)", rtsp_url)
+
+    async def _apply_camera_url_change(self, url: str) -> None:
+        self.camera_url = url
+        LOG.info("[ws] camera URL updated to %s (transport=%s)", self.camera_url, self.camera_rtsp_transport)
+        local_mediamtx = "127.0.0.1" in url or ":8554/" in url
+        if self._uses_mediamtx_grab() and url.startswith("rtsp://") and not local_mediamtx:
+            await asyncio.to_thread(self._update_mediamtx_rtsp_upstream, url)
+        ok = await asyncio.to_thread(
+            self._grab_camera_frame,
+            self.camera_url if not self._uses_mediamtx_grab() else self.mediamtx_cfg.rtsp_url,
+            self.agent_root / "run" / "camera_test.jpg",
+            self.camera_timeout,
+            0.0,
+        )
+        if ok:
+            await self.emit({"type": "camera_frame", "motion": 0, "timestamp": time.time()})
+        await self.emit(
+            {
+                "type": "camera_status",
+                "url": self.camera_url,
+                "transport": self.camera_rtsp_transport,
+                "connected": ok,
+            }
+        )
+
+    async def _test_camera_connection(self) -> None:
+        run_dir = self.agent_root / "run"
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            run_dir = Path("/tmp")
+        raw_shot_path = run_dir / "camera_test.jpg"
+        ok = await asyncio.to_thread(
+            self._grab_camera_frame, self.camera_url, raw_shot_path, self.camera_timeout, 0.0
+        )
+        await self.emit({
+            "type": "camera_status",
+            "url": self.camera_url,
+            "transport": self.camera_rtsp_transport,
+            "connected": ok,
+        })
+
+    async def _broadcast_status(self) -> None:
+        preview_exists = (self.agent_root / "ui" / "latest_frame.jpg").is_file()
+        vlm_ready = await asyncio.to_thread(self.ping_llm_daemon)
+        asr_backend = "sense_voice"
+        cfg = getattr(getattr(self, "asr_engine", None), "config", None)
+        if cfg is not None:
+            asr_backend = getattr(cfg, "backend", asr_backend)
+        await self.emit({
+            "type": "status_response",
+            "state": self.state.value if hasattr(self.state, "value") else str(self.state),
+            "camera_url": self.camera_url,
+            "camera_transport": self.camera_rtsp_transport,
+            "scene_memory": getattr(self, "_scene_memory", {}),
+            "preview_exists": preview_exists,
+            "asr_backend": asr_backend,
+            "inference_backend": self.inference_backend,
+            "llm_socket": self.socket_path,
+            "vlm_daemon_ready": vlm_ready,
+            "llm_backend": self.inference_backend,
+            "camera_grab_backend": getattr(self, "camera_grab_backend", "rtsp"),
+            "mediamtx_cache_age_sec": mediamtx_cache_age_sec(self.mediamtx_cfg)
+            if self._uses_mediamtx_grab()
+            else None,
+        })
+
+    async def _board_vlm_with_web_tokens(
+        self,
+        frame_path: Path,
+        prompt: str,
+        *,
+        generation: int,
+    ) -> str:
+        """Run board VLM; stream see tokens to WebUI when using P5b vlm_daemon."""
+        loop = asyncio.get_running_loop()
+        token_queue: asyncio.Queue[str] = asyncio.Queue()
+        stream_tokens = self.inference_backend == "vlm_daemon"
+
+        def on_token(piece: str) -> None:
+            loop.call_soon_threadsafe(token_queue.put_nowait, piece)
+
+        infer_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._infer_vlm,
+                frame_path,
+                prompt,
+                on_token if stream_tokens else None,
+            )
+        )
+        if stream_tokens:
+            while not infer_task.done() or not token_queue.empty():
+                try:
+                    piece = await asyncio.wait_for(token_queue.get(), timeout=0.04)
+                except asyncio.TimeoutError:
+                    continue
+                if generation and generation != self._active_turn_id:
+                    continue
+                await self.emit({"type": "llm_token", "text": piece, "generation": generation})
+        return await infer_task
+
+    def _infer_vlm(
+        self,
+        frame_path: Path,
+        user_prompt: str,
+        on_token: Callable[[str], None] | None = None,
+    ) -> str:
+        prompt = user_prompt.strip() or self.camera_prompt
+
+        # 1. Cloud / LAN VLM API if configured (api_key optional for local Ollama/vLLM)
+        if self.camera_api_url:
+            try:
+                import base64
+                with open(frame_path, "rb") as f:
+                    b64_data = base64.b64encode(f.read()).decode("ascii")
+                endpoint = self.camera_api_url.rstrip("/")
+                if not endpoint.endswith("/chat/completions"):
+                    endpoint += "/chat/completions"
+                payload = {
+                    "model": self.camera_model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"},
+                                },
+                            ],
+                        }
+                    ],
+                    "max_tokens": 128,
+                    "temperature": 0.2,
+                }
+                headers = {"Content-Type": "application/json"}
+                if self.camera_api_key:
+                    headers["Authorization"] = f"Bearer {self.camera_api_key}"
+                req = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                cap = str(res["choices"][0]["message"]["content"]).strip()
+                if cap:
+                    return cap
+            except Exception as exc:
+                LOG.warning("[vision] VLM API call failed: %s", exc)
+
+        # 2. Board RKNN VLM (P5b socket or legacy run_board_vlm.sh)
+        try:
+            LOG.info("[vision] board VLM via xiaolan_cli.brain backend=%s", self.inference_backend)
+            if self.brain.unified_vlm:
+                cap = self.brain.see_via_socket(
+                    frame_path,
+                    prompt,
+                    on_token=on_token,
+                    max_new_tokens=self.camera_see_max_new_tokens,
+                )
+            elif self.camera_vlm_cmd:
+                # Legacy path stops llm_daemon while the VLM demo runs (up to 200s).
+                cap = self.brain.board_vlm(frame_path, prompt)
+            else:
+                LOG.info("[vision] no VLM backend (vlm_daemon off, camera.vlm_cmd empty); skip board VLM")
+                cap = ""
+            if cap:
+                return cap
+        except Exception as exc:
+            LOG.warning("[vision] board VLM failed: %s", exc)
+
+        # 3. Fallback: simple natural confirmation
+        return "好的，已经拍下当前画面了。"
+
+    def _load_scene_memory(self) -> dict[str, Any]:
+        try:
+            if hasattr(self, "_scene_memory_file") and self._scene_memory_file.is_file():
+                data = json.loads(self._scene_memory_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("caption"):
+                    LOG.info("[vision] loaded visual scene memory: %s", data.get("caption"))
+                    return data
+        except Exception as exc:
+            LOG.warning("[vision] failed to load visual scene memory: %s", exc)
+        return {}
+
+    def _save_scene_memory(self, caption: str, activity: str = "") -> None:
+        try:
+            tags: list[str] = []
+            for kw in ("电脑", "笔记本", "显示器", "屏幕", "键盘", "鼠标", "水杯", "手机", "书籍", "耳机", "咖啡", "平板"):
+                if kw in caption and kw not in tags:
+                    tags.append(kw)
+            import datetime
+            self._scene_memory = {
+                "caption": caption,
+                "activity": activity or ("正在电脑前专注工作" if any(k in caption for k in ("电脑", "屏幕", "键盘")) else "室内活动"),
+                "tags": tags or ["桌面物品"],
+                "updated_at": time.monotonic(),
+                "time_str": datetime.datetime.now().strftime("%H:%M:%S"),
+            }
+            if hasattr(self, "_scene_memory_file"):
+                self._scene_memory_file.parent.mkdir(parents=True, exist_ok=True)
+                self._scene_memory_file.write_text(
+                    json.dumps(self._scene_memory, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                LOG.info("[vision] saved visual scene memory: %s", caption)
+            if hasattr(self, "event_bus") and hasattr(self, "_loop") and self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.emit({"type": "scene_memory", "memory": self._scene_memory}),
+                    self._loop,
+                )
+        except Exception as exc:
+            LOG.warning("[vision] failed to save visual scene memory: %s", exc)
+
+    async def _handle_vision_turn(self, user_prompt: str, *, generation: int) -> None:
+        self.set_state(AgentState.LLM)
+        await self.emit({"type": "vision_start", "query": user_prompt, "generation": generation})
+
+        is_refresh_query = any(k in user_prompt for k in ("重新", "重看", "再看", "刷新", "拍张照", "拍个照"))
+        cached_caption = str(getattr(self, "_scene_memory", {}).get("caption", "")).strip()
+
+        # 1. Scene memory fast path (activity-only when using mediamtx — object queries always see)
+        if cached_caption and self._vision_prefers_scene_memory_only(user_prompt):
+            LOG.info(
+                "[vision] zero-wait: using visual scene memory (%.2fs old): %s",
+                time.monotonic() - float(getattr(self, "_scene_memory", {}).get("updated_at", 0.0)),
+                cached_caption,
+            )
+            is_activity_query = any(k in user_prompt for k in ("干什么", "干嘛", "做什么", "在干", "在做", "看我"))
+            if is_activity_query:
+                activity = getattr(self, "_scene_memory", {}).get("activity")
+                if activity:
+                    reply = f"主人，我看到您{activity}，面前放有键盘、鼠标和水杯。"
+                else:
+                    reply = "主人，我看到您正在电脑前编写和调试代码，面前放有键盘、鼠标和水杯。"
+            else:
+                reply = cached_caption
+                if reply.startswith("画面中有一台"):
+                    reply = "主人，桌上有一台" + reply[6:]
+                elif reply.startswith("画面中有"):
+                    reply = "主人，桌上有" + reply[4:]
+                elif not reply.startswith("主人") and not reply.startswith("桌上"):
+                    reply = f"主人，桌上识别到{reply}"
+            await self.emit({"type": "vision_caption", "caption": reply, "generation": generation})
+            self._record_chat_turn(user_prompt, reply)
+            await self._speak_turn(reply, generation=generation)
+            if not self._tts_abort:
+                self._listen_cooldown_until = time.monotonic() + self.listen_cooldown_sec
+            return
+
+        # No filler TTS before see: WebUI already gets vision_start; board see runs immediately.
+        if self._uses_mediamtx_grab():
+            age = mediamtx_cache_age_sec(self.mediamtx_cfg)
+            if mediamtx_cache_available(self.mediamtx_cfg):
+                LOG.info(
+                    "[vision] mediamtx cache ready (age=%s) — no wait TTS",
+                    f"{age:.2f}s" if age is not None else "?",
+                )
+            else:
+                LOG.info("[vision] mediamtx cache missing — still skip wait TTS, grab then see")
+
+        use_mtx_cache = is_refresh_query and self._uses_mediamtx_grab()
+        if use_mtx_cache:
+            synced = await asyncio.to_thread(self._sync_preview_from_mediamtx_cache)
+            if synced:
+                await self.emit(
+                    {
+                        "type": "camera_frame",
+                        "motion": 0,
+                        "timestamp": time.time(),
+                        "grab_source": "cache",
+                    }
+                )
+
+        run_dir = self.agent_root / "run"
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            run_dir = Path("/tmp")
+        raw_shot_path = run_dir / "camera_shot.jpg"
+        vlm_frame_path = run_dir / "latest_vlm.jpg"
+
+        t0 = time.monotonic()
+        grab_source = "miss"
+        try:
+            ok, grab_source = await asyncio.to_thread(
+                self._grab_and_prepare_vlm_frame,
+                raw_shot_path,
+                vlm_frame_path,
+                force_live=False,
+                cache_only=use_mtx_cache,
+            )
+            if use_mtx_cache and not ok:
+                ok, grab_source = await asyncio.to_thread(
+                    self._grab_and_prepare_vlm_frame,
+                    raw_shot_path,
+                    vlm_frame_path,
+                    force_live=False,
+                    cache_only=False,
+                )
+            success, caption = False, ""
+            if ok:
+                LOG.info("[vision] grab source=%s prep=vlm_frame", grab_source)
+                await self.emit(
+                    {
+                        "type": "camera_frame",
+                        "motion": 0,
+                        "timestamp": time.time(),
+                        "grab_source": grab_source,
+                    }
+                )
+                caption = await self._board_vlm_with_web_tokens(
+                    vlm_frame_path, user_prompt, generation=generation
+                )
+                success = True
+        except Exception as exc:
+            LOG.error("[vision] exception during vision turn: %s", exc)
+            success, caption = False, ""
+
+        if self._tts_abort or generation != self._active_turn_id:
+            LOG.info("[vision] turn aborted or superseded")
+            return
+
+        if not success:
+            LOG.warning("[vision] camera frame grab failed")
+            await self.emit({"type": "vision_error", "error": "camera_unreachable", "generation": generation})
+            await self._speak_turn("摄像头暂时连接不上，请确认摄像头已打开。", generation=generation)
+            return
+
+        if not caption or caption == "好的，已经拍下当前画面了。":
+            caption = "画面中未识别到具体物品。"
+        else:
+            self._save_scene_memory(caption)
+
+        LOG.info(
+            "[vision] caption ready in %.2fs (grab=%s): %s",
+            time.monotonic() - t0,
+            grab_source,
+            caption,
+        )
+        await self.emit({"type": "vision_caption", "caption": caption, "generation": generation})
+
+        if not self._tts_abort and generation == self._active_turn_id:
+            self._record_chat_turn(user_prompt, caption)
+            await self._speak_turn(caption, generation=generation)
+            if not self._tts_abort:
+                self._listen_cooldown_until = time.monotonic() + self.listen_cooldown_sec
+
+    async def _run_llm(
+        self,
+        prompt: str,
+        *,
+        generation: int,
+        vad_end_at: float,
+        is_companion: bool = False,
+    ) -> None:
+        user_prompt = prompt
+        self.set_state(AgentState.LLM)
+        intent_ack_played = False  # the ack was already said while classifying
+        pushed_recent = False  # this turn is already in self._recent
+        forced_teacher = None  # the intent classifier sent this to the teacher
+
+        u_clean = user_prompt.strip()
+        normalized = normalize_spoken_text(u_clean)
+        if len(normalized) >= 4:
+            self._mark_activity()   # a real sentence (not "哎" / "谢" / room noise): background study waits
+
+        if not is_companion:
+            if is_resume_command(normalized):
+                if getattr(self, "_paused_relay_text", None):
+                    relay = self._paused_relay_text
+                    self._paused_relay_text = None
+                    LOG.info("[relay] resuming playback from paused sentences (%d chars): %s", len(relay), relay[:60])
+                    await self._speak_turn(relay, generation=generation)
+                    return
+                elif not self._chat_turns:
+                    await self._speak_turn("随时待命，主人请吩咐。", generation=generation)
+                    return
+
+            if is_stop_command(normalized):
+                self._paused_relay_text = None
+                LOG.info("[llm] user requested stop: %s", u_clean)
+                await self._speak_turn("好的，主人。", generation=generation)
+                return
+
+            self._paused_relay_text = None
+
+            pending = getattr(self, "_agent_pending", None)
+            if pending:
+                answer = approval_answer(u_clean)
+                if answer is not None:
+                    for fut in list(pending.values()):
+                        if not fut.done():
+                            fut.set_result(answer)
+                    LOG.info("[agent] spoken approval: %s", answer)
+                    return
+
+            # Before the filler filter: normalize_spoken_text collapses "谢谢" to "谢",
+            # which the single-char rule below would otherwise drop as noise.
+            device_cmd = parse_device_command(u_clean) if getattr(self, "devices", None) else None
+            if device_cmd:
+                LOG.info("[devices] command=%s", device_cmd)
+
+                async def say(text: str) -> None:
+                    await self._speak_turn(text, generation=generation)
+
+                try:
+                    reply = await self.devices.handle(device_cmd, say)
+                except Exception as exc:
+                    LOG.warning("[devices] %s failed: %s", device_cmd, exc)
+                    reply = "哎呀，扫描出了点问题，等会儿再试试。"
+                await self._speak_turn(reply, generation=generation)
+                self._record_chat_turn(user_prompt, reply)
+                return
+
+            if len(u_clean) <= 8 and re.search(r"自检|检查一下系统|系统检查", u_clean):
+                report = await self._selftest_report(full=True)
+                await self._speak_turn(report, generation=generation)
+                self._record_chat_turn(user_prompt, report)
+                return
+
+            new_title = parse_title_command(user_prompt)
+            if new_title is not None:
+                await self._set_user_title(new_title)
+                reply = f"好的，{new_title}，以后就这么称呼您。" if new_title else "好的，以后不这么叫了。"
+                await self._speak_turn(reply, generation=generation)
+                self._record_chat_turn(user_prompt, reply)
+                return
+
+            vol = parse_volume_command(u_clean, self._speaker_volume_percent()) if hasattr(self, "audio_profile") else None
+            if vol is not None:
+                target, reply = vol
+                if target is not None and target != self._speaker_volume_percent():
+                    await self._apply_settings_patch({"speaker_volume": target})
+                LOG.info("[volume] voice command: %s -> %s", u_clean[:24], target)
+                await self._speak_turn(reply, generation=generation)
+                self._record_chat_turn(user_prompt, reply)
+                return
+
+            quick = quick_reply_for(u_clean) if getattr(self, "quick_reply_enabled", False) else None
+            if quick:
+                LOG.info("[llm] quick reply (skip LLM): %s", quick)
+                await self._speak_turn(quick, generation=generation)
+                self._record_chat_turn(user_prompt, quick)
+                return
+
+            if len(normalized) <= 1 or (normalized and set(normalized) <= set("啊嗯呃哦呀吧呵哈嘿")):
+                LOG.info("[llm] ignored single char or filler noise: %s", u_clean)
+                self.set_state(AgentState.LISTEN)
+                return
+
+            if self.camera_enabled and is_vision_query(normalized):
+                LOG.info("[vision] visual query recognized: %s", u_clean)
+                await self._handle_vision_turn(user_prompt, generation=generation)
+                return
+
+            voice_reply = self.voice_settings.try_rule_command(user_prompt) if hasattr(self, "voice_settings") and self.voice_settings else None
+            if voice_reply is None and is_voice_settings_query(user_prompt):
+                LOG.info("[voice] fuzzy voice query (rule miss): %s", user_prompt[:48])
+                voice_reply = self.voice_settings.describe_for_user() if hasattr(self, "voice_settings") and self.voice_settings else None
+            if voice_reply:
+                LOG.info("[voice] rule command: %s", voice_reply[:48])
+                await self._sync_tts_from_voice_settings()
+                await self._speak_turn(voice_reply, generation=generation)
+                self._record_chat_turn(user_prompt, voice_reply)
+                return
+
+            # "开个项目：…" / "项目做得怎么样": she works on projects by herself (learning/project.py)
+            from learning.project import project_command
+            proj = project_command(user_prompt)
+            if proj is not None:
+                reply = await asyncio.to_thread(proj)
+                LOG.info("[project] %s -> %s", user_prompt[:60], reply[:80])
+                await self._speak_turn(reply, generation=generation)
+                self._record_chat_turn(user_prompt, reply)
+                return
+
+            # 先分类: the teacher reads the recent turns and says what is wanted (task / knowledge / ...)
+            teacher = getattr(self, "teacher", None)
+            if teacher is not None and getattr(self, "teacher_enabled", False) and getattr(self, "skills", None) is not None:
+                if getattr(self, "ack_enabled", False) and not intent_ack_played:
+                    intent_ack_played = await self._play_ack(user_prompt, generation=generation)  # covers the classify call
+                intent = await asyncio.to_thread(classify_intent, teacher, user_prompt, list(getattr(self, "_recent", [])), known_ssh_hosts())
+            else:
+                from learning.intent import fallback as intent_fallback
+                intent = intent_fallback(u_clean)
+            LOG.info("[intent] %s (%s): %s", intent.kind, intent.by, intent.rewrite[:80])
+            if intent.kind == "unclear" and len(normalized) > 4:
+                LOG.info("[intent] 'unclear' but readable: answer with context instead")
+                from learning.intent import Intent
+                intent = Intent("chat", intent.rewrite or user_prompt, "readable", intent.by)
+            if intent.kind == "unclear":
+                reply = "这句我没听明白，能换个说法再说一遍吗？"
+                await self._speak_turn(reply, generation=generation)
+                self._journal(user_prompt, reply, "intent", "unclear")
+                return
+            if intent.kind == "task" and getattr(self, "skills", None) is not None:
+                if getattr(self, "_agent_running", False):
+                    await self._speak_turn("我手上还有一件事没做完，做完再来办这个。", generation=generation)
+                else:
+                    creds = getattr(self, "_pending_creds", None)
+                    if creds and time.monotonic() - creds.at > 600:
+                        creds = self._pending_creds = None  # said too long ago to belong to this request
+                    if creds and not creds.host:
+                        _, again = extract_credentials(intent.rewrite + " 密码 x")
+                        creds.host = again.host if again else ""
+                    self._pending_creds = None if (creds and creds.host) else creds  # keep it until a host is known
+                    use = creds if (creds and creds.host) else None
+                    LOG.info("[agent] task: %s%s", intent.rewrite[:80], " (with credentials)" if use else "")
+                    self._agent_task = asyncio.create_task(self._run_agent(intent.rewrite, use))
+                return
+            if intent.kind in ("knowledge", "ask_teacher"):
+                forced_teacher = intent
+
+            if should_skip_llm(user_prompt):
+                speak = canned_reply_for(user_prompt) or persona_reply_for(user_prompt)
+                LOG.info("[llm] fast-path (skip LLM): %s", speak[:48])
+                await self._speak_turn(speak, generation=generation)
+                return
+
+
+        learn_route = None
+        memory_ctx = ""
+        memory = getattr(self, "memory", None)  # absent when the learning layer is not set up
+        forced = forced_teacher
+        if not is_companion and memory is not None:
+            correction = bool(getattr(self, "_last_qa", None)) and is_correction(user_prompt)
+            mem_hit = None if correction else await asyncio.to_thread(memory.best_answer, user_prompt)
+            teacher = getattr(self, "teacher", None)
+            learn_route = route(
+                user_prompt, ack_kind(user_prompt),
+                teacher_ok=bool(getattr(self, "teacher_enabled", False) and teacher and teacher.available),
+                memory_answer=mem_hit.answer if mem_hit else "", correction=correction,
+            )
+            if forced is not None and learn_route.who != "teacher" and teacher is not None and teacher.available:
+                if not (forced.kind == "knowledge" and learn_route.who == "memory"):
+                    learn_route = Route("teacher", forced.kind)  # the classifier says: this needs the teacher
+            LOG.info("[learn] route=%s (%s)", learn_route.who, learn_route.reason)
+            if learn_route.who == "memory":
+                await self._speak_turn(learn_route.memory_answer, generation=generation)
+                self._record_chat_turn(user_prompt, learn_route.memory_answer)
+                self._journal(user_prompt, learn_route.memory_answer, "memory", learn_route.reason)
+                self._last_qa = (user_prompt, learn_route.memory_answer)
+                return
+            memory_ctx = await asyncio.to_thread(memory.context_for, user_prompt)
+
+        ack_played = intent_ack_played
+        if not ack_played and not is_companion and getattr(self, "ack_enabled", False):
+            ack_played = await self._play_ack(user_prompt, generation=generation)
+
+        await self._prepare_llm_call()
+        prompt = self._build_llm_prompt(user_prompt, memory_ctx)
+        LOG.info(
+            "[llm] hist=%d/%d prompt %d chars · user=%s",
+            getattr(self, "_last_history_turns", 0),
+            self.history_max_turns,
+            len(prompt),
+            user_prompt[:48],
+        )
+        self._active_tts_text = ""
+        loop = asyncio.get_running_loop()
+        token_queue: asyncio.Queue[str] = asyncio.Queue()
+        splitter = StreamingSentenceSplitter(min_clause_chars=7, max_clause_chars=26)
+        self._current_splitter = splitter
+        tts_state: dict[str, Any] = {"n": 0, "canned": False, "spoken_keys": set(), "spoken_texts": []}
+        first_token_at: float | None = None
+
+        def on_token(piece: str) -> None:
+            loop.call_soon_threadsafe(token_queue.put_nowait, piece)
+
+        try:
+            reply_parts: list[str] = []
+            use_teacher = learn_route is not None and learn_route.who == "teacher"
+            memo_filter = MemoFilter()
+            teacher_q, teacher_wrong = user_prompt, ""
+            persona_system = self._system_body(memory_ctx)
+
+            def run_local() -> dict:
+                return llm_chat_stream(prompt, on_token, sock_path=self.socket_path, max_new_tokens=self.max_new_tokens)
+
+            if use_teacher:
+                teacher_user = forced.rewrite if forced is not None else user_prompt
+                ctx = recent_block(getattr(self, "_recent", []))
+                if ctx:
+                    teacher_user = f"最近的对话（供理解上下文）：\n{ctx}\n\n主人现在说：{user_prompt}\n（意思是：{teacher_user}）"
+                if learn_route.reason == "correction" and self._last_qa:
+                    teacher_q, teacher_wrong = self._last_qa
+                    teacher_user = (f"刚才主人问：{teacher_q}\n你回答：{teacher_wrong}\n主人说：{user_prompt}\n"
+                                    "请直接给主人正确的答案。记忆卡片里的 q 写原来的问题。")
+                teacher_user += f"\n（答完另起一行附上{MEMO_MARK}卡片）"
+
+                def on_teacher_token(piece: str) -> None:
+                    out = memo_filter.feed(piece)
+                    if out:
+                        on_token(out)
+
+                def run_teacher() -> dict:
+                    try:
+                        text = self.teacher.stream(teacher_system(persona_system, ""), teacher_user, on_teacher_token)
+                    except TeacherUnavailable as exc:
+                        LOG.warning("[learn] teacher unavailable (%s), local model answers", exc)
+                        return dict(run_local(), teacher=False)
+                    tail = memo_filter.finish()
+                    if tail:
+                        on_token(tail)
+                    return {"text": text.split(MEMO_MARK)[0], "teacher": True}
+
+                llm_task = asyncio.create_task(asyncio.to_thread(run_teacher))
+            else:
+                llm_task = asyncio.create_task(asyncio.to_thread(run_local))
+            while not llm_task.done() or not token_queue.empty():
+                try:
+                    piece = await asyncio.wait_for(token_queue.get(), timeout=0.04)
+                except asyncio.TimeoutError:
+                    continue
+                if self._tts_abort or generation != self._active_turn_id:
+                    continue
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                self._active_tts_text += piece
+                for chunk in splitter.feed(piece):
+                    if is_echo_reply(user_prompt, chunk):
+                        LOG.warning("[llm] suppressed echo chunk: %s", chunk)
+                        continue
+                    if ack_played and int(tts_state["n"]) == 0:
+                        chunk = strip_leading_ack(chunk)
+                        if not is_speakable(sanitize_tts_text(chunk)):
+                            continue
+                    if int(tts_state["n"]) > 0 and is_closing_filler(chunk):
+                        LOG.info("[llm] dropped closing filler: %s", chunk)
+                        continue
+                    queued = await self._enqueue_speak(chunk, tts_state, generation=generation)
+                    if queued:
+                        await self.emit({"type": "llm_token", "text": chunk})
+
+            reply = await llm_task
+            reply_parts.append(str(reply.get("text") or ""))
+            hit_limit = self._reply_hit_segment_limit(reply)
+            if hit_limit:
+                LOG.warning(
+                    "[llm] RKNN reached the %d-token generation window; not re-prompting because that restarts the answer",
+                    self.max_new_tokens,
+                )
+
+            if not self._tts_abort and generation == self._active_turn_id:
+                for chunk in splitter.finish():
+                    if is_echo_reply(user_prompt, chunk):
+                        LOG.warning("[llm] suppressed echo chunk: %s", chunk)
+                        continue
+                    if ack_played and int(tts_state["n"]) == 0:
+                        chunk = strip_leading_ack(chunk)
+                        if not is_speakable(sanitize_tts_text(chunk)):
+                            continue
+                    if int(tts_state["n"]) > 0 and is_closing_filler(chunk):
+                        LOG.info("[llm] dropped closing filler: %s", chunk)
+                        continue
+                    queued = await self._enqueue_speak(chunk, tts_state, generation=generation)
+                    if queued:
+                        await self.emit({"type": "llm_token", "text": chunk})
+
+            # If we hit the token limit AND the last spoken text was a fragment (no ending
+            # punctuation), speak a natural trailing cue so the listener knows more was cut off.
+            if (
+                hit_limit
+                and not self._tts_abort
+                and generation == self._active_turn_id
+            ):
+                spoken: list[str] = tts_state.get("spoken_texts") or []
+                last_spoken = spoken[-1] if spoken else ""
+                last_spoken_clean = last_spoken.rstrip()
+                if last_spoken_clean and not last_spoken_clean.endswith(("。", "！", "？", "…")):
+                    LOG.info("[llm] token-limit truncation detected, appending trail cue")
+                    trail_cue = "以上是我目前能说的部分，如需了解更多请继续询问。"
+                    await self._enqueue_speak(trail_cue, tts_state, generation=generation)
+
+            full = clean_llm_reply(user_prompt, "".join(reply_parts))
+            if not is_companion and full and memory is not None:
+                self._last_qa = (user_prompt, full)
+            if use_teacher and reply.get("teacher") and full:
+                memo = parse_memo(memo_filter.memo)
+                try:
+                    await asyncio.to_thread(
+                        self.learner.learn, teacher_q, full, memo,
+                        system=self._system_body(), wrong=teacher_wrong,
+                        keep_if_no_card=learn_route.reason in ("lookup", "explain", "fact"),
+                    )
+                    LOG.info("[learn] learned from teacher: remember=%s facts=%s memo_q=%s",
+                             memo.get("remember"), memo.get("facts"), str(memo.get("q", ""))[:30])
+                except Exception as exc:  # learning must never break the turn
+                    LOG.warning("[learn] failed to store: %s", exc)
+
+            if hasattr(self, "voice_settings") and self.voice_settings:
+                full, _settings_applied = self.voice_settings.parse_and_strip_llm_tag(full)
+                if _settings_applied:
+                    LOG.info("[voice] llm tag applied")
+                    await self._sync_tts_from_voice_settings()
+
+            if is_echo_reply(user_prompt, full):
+                LOG.warning("[llm] detected echo reply ('%s' -> '%s'), wiping history", user_prompt, full)
+                self._chat_turns.clear()
+                full = "我没有听清楚，请再说一遍。"
+                if int(tts_state["n"]) == 0 and not self._tts_abort:
+                    await self._speak_extracted(full, canned=True, generation=generation)
+
+            spoken_texts: list[str] = tts_state["spoken_texts"]
+            if spoken_texts:
+                full = "".join(spoken_texts)
+                self._active_tts_text = full
+
+            self._last_spoken_turn = full
+
+            if not self._tts_abort:
+                await self._emit_reply_final(full)
+
+            if int(tts_state["n"]) == 0 and not self._tts_abort:
+                speak = persona_reply_for(user_prompt)
+                LOG.info("[llm] persona fallback: %s", speak[:48])
+                await self._speak_extracted(speak, canned=True, generation=generation)
+                full = speak
+                self._last_spoken_turn = full
+                if not self._tts_abort:
+                    await self._emit_reply_final(full)
+            elif not self._tts_abort:
+                if full.strip():
+                    self._push_recent(user_prompt, full, "teacher" if use_teacher and reply.get("teacher") else "local")
+                    pushed_recent = True
+                try:
+                    await self.tts_queue.wait_done(generation=generation)
+                finally:
+                    self._speaking = False
+                    self._last_tts_end_at = time.monotonic()
+
+            if not self._tts_abort:
+                self._listen_cooldown_until = time.monotonic() + self.listen_cooldown_sec
+                if full.strip():
+                    self._record_chat_turn(user_prompt, full)
+                    answered_by = "teacher" if use_teacher and reply.get("teacher") else "local"
+                    self._journal(user_prompt, full, answered_by, learn_route.reason if learn_route else "",
+                                  recent=not pushed_recent)
+
+            first_play_at = self.tts_queue.first_play_at
+            if first_play_at is not None:
+                latency = {
+                    "type": "latency",
+                    "generation": generation,
+                    "vad_to_first_token_ms": round(
+                        1000 * ((first_token_at or first_play_at) - vad_end_at), 1
+                    ),
+                    "vad_to_first_play_ms": round(1000 * (first_play_at - vad_end_at), 1),
+                }
+                await self.emit(latency)
+                LOG.info("[latency] turn=%d first_token=%sms first_play=%sms", generation, latency["vad_to_first_token_ms"], latency["vad_to_first_play_ms"])
+
+            LOG.info(
+                "[llm] reply (%d chars, ttft=%.3fs): %s",
+                len(full),
+                reply.get("ttft_s") or 0.0,
+                full[:60],
+            )
+            if self._tts_abort:
+                LOG.info("[barge-in] skipped post-abort cooldown")
+        except Exception as exc:
+            unavailable = isinstance(exc, LlmUnavailableError)
+            if unavailable:
+                LOG.error("[llm] daemon unavailable: %s", exc)
+            else:
+                LOG.exception("[llm] request failed (%s): %r", type(exc).__name__, exc)
+            await self.emit({"type": "error", "code": "llm_unavailable" if unavailable else "llm_failed"})
+            if not self._tts_abort and generation == self._active_turn_id:
+                msg = (
+                    "主人，大模型正在启动，请稍等半分钟再问我。"
+                    if unavailable
+                    else "主人，刚才没处理好，请再说一遍。"
+                )
+                try:
+                    await self._speak_turn(msg, generation=generation)
+                except Exception:
+                    LOG.exception("[tts] recovery prompt failed")
+        finally:
+            self._current_splitter = None
+            if ack_played and int(tts_state["n"]) == 0:
+                self._speaking = False
+
+    # ---------------------------------------------------------------- agent (learn by doing)
+    async def _agent_say(self, text: str) -> None:
+        """Speak from the background agent: wait for the current turn to finish, then take a turn of its own."""
+        for _ in range(120):
+            if not self._turn_busy and not self._speaking:
+                break
+            await asyncio.sleep(0.25)
+        self._next_turn_id += 1
+        generation = self._next_turn_id
+        self._active_turn_id = generation
+        self._tts_abort = False
+        self.tts_queue.mark_utterance_start(generation)
+        await self._speak_turn(text, generation=generation)
+        await self.tts_queue.wait_done(generation=generation)
+        if generation == self._active_turn_id and not self._turn_busy:
+            self.set_state(AgentState.LISTEN)
+
+    async def _agent_approve(self, step: dict, why: str, risk: str = "ask") -> str:
+        """Ask the owner (voice + web page) before a step that is not known read-only; no answer = no.
+        -> "once" | "always" (remember: ask-level only) | "deny". Danger-level steps are asked every time."""
+        aid = uuid.uuid4().hex[:8]
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._agent_pending[aid] = fut
+        action = describe_step(step)
+        danger = risk == "danger"
+        LOG.info("[agent] approval %s: %s (%s, %s)", aid, action, risk, why)
+        await self.emit({"type": "agent_confirm", "id": aid, "action": action, "why": why, "risk": risk,
+                         "rememberable": not danger, "purpose": str(step.get("purpose") or "")})
+        # short spoken question (a task may ask several times); the full command is on the web page
+        first_ask = not getattr(self, "_agent_asked", False)  # "这次都行" not explained yet in this task
+        purpose = re.sub(r"[。.！!？?，,\s]+$", "", str(step.get("purpose") or ""))
+        what = _spoken_step(step)
+        head = f"{purpose}，要{what}" if purpose else f"要{what}"
+        if not fut.done():  # already answered on the web page: don't ask out loud
+            if danger:
+                backup = "我会先存备份，" if step.get("tool") == "shell" else ""
+                await self._agent_say(f"{head}。这步有风险，{why}，{backup}行吗？")
+            elif first_ask:  # explained on the first ask-level question (danger steps can't use it)
+                self._agent_asked = True
+                await self._agent_say(f"{head}，行吗？说确认；说这次都行，这个任务就不再一步步问你。")
+            else:
+                await self._agent_say(f"{head}，行吗？")
+        try:
+            answer = str(await asyncio.wait_for(fut, timeout=self.agent_approval_timeout))
+        except asyncio.TimeoutError:
+            answer = "deny"
+            await self._agent_say("没等到你的确认，这一步我就不做了。")
+        finally:
+            self._agent_pending.pop(aid, None)
+            await self.emit({"type": "agent_confirm_closed", "id": aid})
+        if answer in ("always", "task") and danger:
+            answer = "once"  # dangerous steps are never remembered, not even for the rest of the task
+            await self._agent_say("这一步有风险，我只做这一次，下次还会问你。")
+        LOG.info("[agent] approval %s -> %s", aid, answer)
+        return answer
+
+    async def _run_agent(self, task: str, creds: Credentials | None = None) -> None:
+        async def progress(p: dict) -> None:
+            await self.emit({"type": "agent_step", **p})
+
+        agent = Agent(self.teacher, self.skills, approve=self._agent_approve, say=self._agent_say, progress=progress,
+                      mcp=getattr(self, "mcp", None),
+                      local_plan=local_planner(self.socket_path) if getattr(self, "agent_local_first", False) else None,
+                      sandbox=sandbox_run_step if getattr(self, "agent_sandbox", False) else None,
+                      grants=getattr(self, "grants", None), log_training=lambda q, a: self.learner.log_training(q, a, system=self._system_body()))
+        await self.emit({"type": "agent_start", "task": task})
+        self._agent_asked = False  # the first question of a task explains "这次都行"
+        self._mark_activity()
+        self._agent_running = True
+        try:
+            res = await agent.run(task, creds)
+        except Exception:  # noqa: BLE001
+            LOG.exception("[agent] crashed")
+            res = AgentResult(False, "出了点意外，这次没做成。")
+        finally:
+            self._agent_running = False  # busy until the result is in, not until the summary is spoken
+        LOG.info("[agent] done ok=%s learned=%s steps=%d: %s", res.ok, res.learned, len(res.steps), res.say[:80])
+        await self.emit({"type": "agent_done", "ok": res.ok, "learned": res.learned, "say": res.say})
+        await self._emit_reply_final(res.say)
+        await self._agent_say(res.say)
+        self._journal(task, res.say, "agent", "ok" if res.ok else "failed")
+
+    async def _play_ack(self, user_text: str, *, generation: int) -> bool:
+        """Say a fitting ack ("好嘞，" / "我看看，" ...) from a cached clip right away, before the LLM answer."""
+        cache = getattr(self, "_ack_cache", {})
+        phrase = ack_for(user_text)
+        if phrase not in cache:
+            # that clip failed to synthesize: use another cached phrase of the same kind
+            phrase = next((p for p in ACK_GROUPS[ack_kind(user_text)] if p in cache), phrase)
+        wav = cache.get(phrase)
+        if wav is None or self._tts_abort or generation != self._active_turn_id:
+            return False
+        if not await self.tts_queue.enqueue_wav(phrase, wav, generation=generation):
+            return False
+        self._speaking = True
+        self._last_ack_text = phrase
+        LOG.info("[llm] ack before answer: %s", phrase)
+        await self.emit({"type": "tts_sentence", "text": phrase})
+        return True
+
+    async def _warm_ack_cache(self) -> None:
+        """Pre-synthesize ack phrases and fixed replies for the current voice/speed so they play instantly."""
+        if not self.ack_enabled and not getattr(self, "quick_reply_enabled", False):
+            return
+        rt = self.voice_settings.runtime if getattr(self, "voice_settings", None) else None
+        tag = f"{getattr(rt, 'voice_id', 'default')}_{getattr(rt, 'speed', 1.0):.2f}"
+        cache_dir = self.agent_root / "run" / "ack_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        async def clip(text: str, prefix: str) -> Path | None:
+            # keyed by content, so editing a phrase never maps a name to the wrong clip
+            digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+            path = cache_dir / f"{prefix}_{tag}_{digest}.wav"
+            # sampling TTS (qwen3) can occasionally run on past the phrase or come out nearly
+            # silent: retry long or silent clips
+            max_sec = 0.6 + 0.3 * len(text)
+
+            def good() -> bool:
+                return (path.is_file() and path.stat().st_size >= 1000 and _wav_seconds(path) <= max_sec
+                        and _wav_voiced_share(path) >= MIN_VOICED_SHARE)
+
+            try:
+                for _ in range(4):
+                    if await asyncio.to_thread(good):
+                        break
+                    await self.tts_queue.synthesize_to(text, path)
+                if _wav_seconds(path) > max_sec:
+                    raise RuntimeError(f"clip too long ({_wav_seconds(path):.1f}s)")
+                if _wav_voiced_share(path) < MIN_VOICED_SHARE:
+                    raise RuntimeError(f"clip nearly silent ({_wav_voiced_share(path):.0%} voiced)")
+                return path
+            except Exception as exc:
+                LOG.warning("[llm] %s cache %r failed: %s", prefix, text, exc)
+                return None
+
+        if self.ack_enabled:
+            fresh: dict[str, Path] = {}
+            for phrase in ACK_PHRASES:
+                if (path := await clip(phrase, "ack")) is not None:
+                    fresh[phrase] = path
+            self._ack_cache = fresh
+            LOG.info("[llm] ack cache ready (%d phrases, %s)", len(fresh), tag)
+        if getattr(self, "quick_reply_enabled", False):
+            # cache clause by clause, the way _speak_extracted sends them, keyed by the spoken form
+            clips: dict[str, Path] = {}
+            for reply in [*fixed_replies(), *FIXED_SPOKEN]:
+                for sent in extract_speak_sentences(reply, max_cjk=99999):
+                    for clause in split_tts_clauses(sent):
+                        key = self.tts_queue.spoken_form(sanitize_tts_text(clause))
+                        if key and key not in clips and is_speakable(key):
+                            if (path := await clip(key, "clip")) is not None:
+                                clips[key] = path
+            self.tts_queue.clip_cache = clips
+            LOG.info("[tts] fixed reply clips ready (%d clauses, %s)", len(clips), tag)
+
+    async def run(self, inject_wav: str | None = None) -> None:
+        self._loop = asyncio.get_running_loop()
+        (self.agent_root / "run").mkdir(parents=True, exist_ok=True)
+        (self.agent_root / "logs").mkdir(parents=True, exist_ok=True)
+        self.set_state(AgentState.IDLE)
+        self.ping_llm_daemon()
+        self.audio_profile.apply_usb_mixer()
+        await self.emit(
+            {
+                "type": "audio_profile",
+                "profile_id": self.audio_profile.active.profile_id,
+                "label": self.audio_profile.active.label,
+                "capture_device": self.audio_profile.active.capture_device,
+                "play_script": self.audio_profile.active.play_script,
+            }
+        )
+        await self.tts_queue.start()
+        asyncio.create_task(self._warm_ack_cache())
+        asyncio.create_task(self._boot_selftest())
+        asyncio.create_task(self._selfheal_notice())
+        asyncio.create_task(self._notice_loop())
+        try:
+            if self.api_enabled:
+                try:
+                    self._ws_server = await run_ws_server(
+                        self.event_bus,
+                        self.api_host,
+                        self.api_port,
+                        on_message=self._handle_ws_message,
+                    )
+                except OSError as exc:
+                    LOG.warning(
+                        "[api] WebSocket bind failed (%s) — voice pipeline continues without WS",
+                        exc,
+                    )
+            await asyncio.gather(
+                self.run_vad_loop(inject_wav),
+                self.handle_events(),
+                self._turn_worker(),
+                self._proactive_companion_loop(),
+            )
+        finally:
+            if self._ws_server is not None:
+                self._ws_server.close()
+                await self._ws_server.wait_closed()
+                self._ws_server = None
+            await self.tts_queue.stop()
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="R1 agent orchestrator (Phase E)")
+    parser.add_argument("--config", default="/userdata/agent/config/agent.yaml")
+    parser.add_argument("--agent-root", default="/userdata/agent")
+    parser.add_argument("--inject-wav", help="offline test: feed wav instead of mic")
+    parser.add_argument("--audio-profile", choices=("auto", "board", "fy_sp701"), help="audio I/O profile")
+    parser.add_argument("--no-partial", action="store_true", help="disable partial ASR (faster offline test)")
+    parser.add_argument("--no-tts", action="store_true", help="skip TTS playback")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    agent_root = Path(args.agent_root)
+    if str(agent_root) not in sys.path:
+        sys.path.insert(0, str(agent_root))
+
+    cfg = load_yaml(args.config)
+    if args.audio_profile:
+        cfg["_cli_audio_profile"] = args.audio_profile
+    setup_logging(args.log_level)
+    LOG.info("=== R1 orchestrator Phase E ===")
+    orch = Orchestrator(cfg, agent_root)
+    if args.no_partial or args.inject_wav:
+        orch.asr_engine.cfg.partial_enabled = False
+    if args.no_tts:
+        async def _noop_enqueue(text: str, *, generation: int | None = None) -> None:
+            LOG.info("[tts] skipped: %s", text[:60])
+
+        async def _noop_wait(generation: int | None = None) -> None:
+            return None
+
+        orch.tts_queue.enqueue = _noop_enqueue  # type: ignore[method-assign]
+        orch.tts_queue.wait_done = _noop_wait  # type: ignore[method-assign]
+    try:
+        asyncio.run(orch.run(inject_wav=args.inject_wav))
+    except KeyboardInterrupt:
+        LOG.info("stopped")
+
+
+if __name__ == "__main__":
+    main()

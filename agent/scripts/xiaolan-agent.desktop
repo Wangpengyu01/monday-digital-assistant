@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=星期一语音助手
+Name[zh_CN]=星期一语音助手
+Comment=打开星期一语音助手控制面板
+Comment[zh_CN]=打开星期一语音助手控制面板
+Exec=/bin/bash /userdata/agent/scripts/open_agent_gui.sh
+Path=/userdata/agent
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Audio;
+StartupNotify=true
