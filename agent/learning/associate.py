@@ -45,7 +45,8 @@ RELS = ("因果", "相似", "组成", "同一场景", "先后", "对立", "用�
 GRAPH_SYSTEM = (
     "从语音助手「星期一」和主人的对话里，找出主人生活和工作里的「东西」以及它们之间的关系，用来帮她以后举一反三。"
     "东西：事物、人、地方、习惯、项目、设备、话题，名字要短（两到八个字），同一个东西用同一个名字。"
-    f"关系只能是：{'、'.join(RELS)}，并用一句话说为什么。只要对话里看得出来、或常识上站得住的，不编。最多二十个东西、三十条关系。\n"
+    f"关系只能是：{'、'.join(RELS)}，并用一句话说为什么。只要对话里看得出来、或常识上站得住的，不编。最多二十个东西、三十条关系。"
+    "主人本人和星期一自己不要列成东西，提到主人就写「主人」，不要写他的名字；主人只是问过一次的事是话题，不要写成他的计划或项目。\n"
     '只输出 JSON：{"nodes": [{"name": "...", "kind": "..."}], "edges": [{"a": "...", "b": "...", "rel": "...", "why": "..."}]}'
 )
 WANDER_SYSTEM = (
@@ -97,12 +98,16 @@ def save(d: dict, learning_dir: Path = LEARNING) -> None:
     os.replace(tmp, learning_dir / FILE)
 
 
-def merge(d: dict, nodes: list[dict], edges: list[dict], day: str) -> tuple[int, int]:
-    """-> (new nodes, new edges)."""
+SELF = {"主人", "星期一", "我", "你", "她"}   # the owner and she herself are the centre, not things to wander from
+
+
+def merge(d: dict, nodes: list[dict], edges: list[dict], day: str, skip: set[str] | None = None) -> tuple[int, int]:
+    """-> (new nodes, new edges). skip: names never kept (what the owner is called)."""
+    skip = SELF | (skip or set())
     new_n = new_e = 0
     for n in nodes:
         name = norm(n.get("name"))
-        if len(name) < 2:
+        if len(name) < 2 or name in skip:
             continue
         cur = d["nodes"].get(name)
         if cur is None:
@@ -113,7 +118,7 @@ def merge(d: dict, nodes: list[dict], edges: list[dict], day: str) -> tuple[int,
             cur["last"] = day
     for e in edges:
         a, b, rel = norm(e.get("a")), norm(e.get("b")), str(e.get("rel") or "")
-        if len(a) < 2 or len(b) < 2 or a == b or rel not in RELS:
+        if len(a) < 2 or len(b) < 2 or a == b or rel not in RELS or a in skip or b in skip:
             continue
         for x in (a, b):
             d["nodes"].setdefault(x, {"kind": "", "seen": 1, "last": day})
@@ -153,8 +158,13 @@ def context_for(text: str, learning_dir: Path = LEARNING, today: str | None = No
         return ""
     today = today or dt.date.today().isoformat()
     parts: list[str] = []
+    seen_edges: set[tuple[str, str, str]] = set()
     for n in mentioned(d, text, 2):
         for e in neighbors(d, n, 2):
+            key = (min(e["a"], e["b"]), max(e["a"], e["b"]), e["rel"])
+            if key in seen_edges:   # both ends mentioned: say the link once
+                continue
+            seen_edges.add(key)
             other = e["b"] if e["a"] == n else e["a"]
             parts.append(f"{n}和{other}（{e['rel']}：{e['why'][:24]}）")
     rest = (dt.date.fromisoformat(today) - dt.timedelta(days=IDEA_REST_DAYS)).isoformat()
@@ -258,9 +268,12 @@ def wander(teacher, ask_local: Callable[[str, str], str], seed: str, *, persona:
 
 def nightly(teacher, ask_local: Callable[[str, str], str], *, persona: str, facts: list[str],
             learning_dir: Path = LEARNING, n_seeds: int = 5, idle: Callable[[], bool] = lambda: True,
-            rng: random.Random | None = None) -> dict:
+            rng: random.Random | None = None, owner_names: set[str] | None = None) -> dict:
     rng = rng or random.Random()
     d = load(learning_dir)
+    for gone in SELF | (owner_names or set()):   # an older graph may still hold them
+        if d["nodes"].pop(gone, None) is not None:
+            d["edges"] = [e for e in d["edges"] if gone not in (e["a"], e["b"])]
     day = dt.date.today().isoformat()
     since = d["last_turn"] or (dt.datetime.now() - dt.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
     turns = read_turns(learning_dir, since)
@@ -268,7 +281,7 @@ def nightly(teacher, ask_local: Callable[[str, str], str], *, persona: str, fact
     if turns:
         try:
             g = extract(teacher, turns, facts)
-            res["new_nodes"], res["new_edges"] = merge(d, g.get("nodes") or [], g.get("edges") or [], day)
+            res["new_nodes"], res["new_edges"] = merge(d, g.get("nodes") or [], g.get("edges") or [], day, skip=owner_names)
             d["last_turn"] = max(t.get("time", "") for t in turns)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("graph extraction failed: %s", exc)
@@ -313,6 +326,15 @@ def wants_ideas(text: str) -> bool:
     return bool(_ASK_IDEAS.search(re.sub(r"\s", "", text or "")))
 
 
+def owner_names(run_dir: Path) -> set[str]:
+    """What the owner is called (the title he chose, e.g. his name): never a node in the graph."""
+    try:
+        title = str(json.loads((run_dir / "user_settings.json").read_text(encoding="utf-8")).get("user_title") or "")
+    except (OSError, ValueError):
+        title = ""
+    return {norm(title)} if norm(title) else set()
+
+
 def local_asker() -> Callable[[str, str], str]:
     from llm.client import llm_chat, llm_clear_history
 
@@ -342,7 +364,8 @@ def main() -> None:
     run_dir = AGENT_ROOT / "run"
     facts = rt.store.facts(limit=8)
     res = nightly(rt.teacher, local_asker(), persona=exam.persona(a.config), facts=facts, learning_dir=rt.learning_dir,
-                  n_seeds=a.seeds, idle=lambda: time.time() - last_activity(run_dir) > IDLE_MIN * 60)
+                  n_seeds=a.seeds, idle=lambda: time.time() - last_activity(run_dir) > IDLE_MIN * 60,
+                  owner_names=owner_names(run_dir))
     print(json.dumps(res, ensure_ascii=False, indent=1))
 
 

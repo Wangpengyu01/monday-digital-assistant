@@ -109,6 +109,18 @@ class AssociateTests(unittest.TestCase):
         say = selfstatus.status_command("星期一你最近有什么想法", learning_dir=self.dir)()
         self.assertTrue(say.startswith("我最近琢磨到一件事。主人睡不好的话"))
 
+    def test_the_owner_and_she_are_not_things_to_wander_from(self) -> None:
+        g = {"nodes": GRAPH["nodes"] + [{"name": "小王", "kind": "人"}, {"name": "星期一", "kind": "助理"}, {"name": "主人", "kind": "人"}],
+             "edges": GRAPH["edges"] + [{"a": "小王", "b": "HomePod", "rel": "属于主人", "why": "x"},
+                                        {"a": "星期一", "b": "HomePod", "rel": "用途", "why": "x"}]}
+        self.night(Teacher(g, []), n_seeds=0, owner_names={"小王"})
+        d = associate.load(self.dir)
+        self.assertFalse({"小王", "星期一", "主人"} & set(d["nodes"]))
+        self.assertEqual(len(d["edges"]), 3)
+        settings = self.dir / "user_settings.json"
+        settings.write_text(json.dumps({"user_title": "小王"}, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(associate.owner_names(self.dir), {"小王"})
+
     def test_the_owner_stops_it(self) -> None:
         res = self.night(Teacher(GRAPH, [verdict()] * 6), n_seeds=3, idle=lambda: False)
         self.assertEqual((res["wandered"], res.get("stopped")), (0, True))
