@@ -222,11 +222,16 @@ def say(learning_dir: Path = LEARNING) -> str:
     if d["focus"]:
         parts.append(f"我现在正在改：{d['focus']}")
     if w["wins"]:
-        parts.append(f"这周我自己修好了{count(len(w['wins']))}个毛病，比如{w['wins'][-1]['title'][:24]}")
+        parts.append(f"这周我自己修好了{count(len(w['wins']))}个毛病，比如{_short(w['wins'][-1]['title'])}")
     open_g = [g for g in d["grudges"] if g["tries"] < MAX_TRIES]
     if open_g:
-        parts.append(f"还有{count(len(open_g))}个没修好，我不服气，还在换办法，比如{open_g[0]['title'][:24]}")
+        parts.append(f"还有{count(len(open_g))}个没修好，我不服气，还在换办法，比如{_short(open_g[0]['title'])}")
     return "。".join(parts) + "。"
+
+
+def _short(title: str) -> str:
+    """The first clause of a title, never cut mid-word ("乱承诺做不到的时间线（今晚给、…）" -> "乱承诺做不到的时间线")."""
+    return re.split(r"[（(，,：:；;]", title)[0][:30]
 
 
 _ASK_DRIVE = re.compile(r"(?:你|星期一).{0,6}(?:在努力什么|努力什么|想变成|想成为|目标是什么|有什么目标|进步了吗|有进步吗|有没有进步|"

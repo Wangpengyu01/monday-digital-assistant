@@ -102,7 +102,7 @@ class DriveTests(unittest.TestCase):
     def test_she_can_say_it(self) -> None:
         drive.feel("你真笨", {"q": "q", "a": "a"}, self.dir)
         drive.feel("谢谢", None, self.dir)
-        drive.record_outcome({"slug": "a", "goal": "修好自己：乱承诺工期", "status": "done"}, self.dir)
+        drive.record_outcome({"slug": "a", "goal": "修好自己：乱承诺工期（今晚给、三四周做完）", "status": "done"}, self.dir)
         drive.record_outcome({"slug": "b", "goal": "修好自己：回答太慢", "status": "gave_up", "summary": "x"}, self.dir)
         say = drive.say(self.dir)
         self.assertTrue(say.startswith("我给自己定的目标是：成为主人离不开的全栈助理"))
