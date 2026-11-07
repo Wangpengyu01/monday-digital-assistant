@@ -540,6 +540,20 @@ class Orchestrator:
         if generation == self._active_turn_id and not self._turn_busy:
             self.set_state(AgentState.LISTEN)
 
+    NIGHT = (23, 8)   # notices wait for the morning (the nightly self-check finishes around 1-2 am)...
+
+    def _night_hold(self, now: float | None = None) -> bool:
+        """...unless the owner is up and has talked in the last 10 minutes."""
+        import datetime
+        t = time.time() if now is None else now
+        hour = datetime.datetime.fromtimestamp(t).hour
+        if not (hour >= self.NIGHT[0] or hour < self.NIGHT[1]):
+            return False
+        try:
+            return t - (self.agent_root / "run" / "last_activity").stat().st_mtime > 600
+        except OSError:
+            return True
+
     async def _notice_loop(self, every: float = 20.0) -> None:
         """Say queued notices (run/notices/*.txt, e.g. a project that finished - learning/project.py) when idle."""
         folder = self.agent_root / "run" / "notices"
@@ -550,6 +564,11 @@ class Orchestrator:
                 files = sorted(folder.glob("*.txt")) if folder.is_dir() else []
                 if not files or self._turn_busy or self._speaking or getattr(self, "_agent_running", False):
                     continue
+                if self._night_hold():
+                    continue
+            except OSError:
+                continue
+            try:
                 text = files[0].read_text(encoding="utf-8").strip()
                 files[0].unlink()
             except OSError:
@@ -2210,6 +2229,20 @@ class Orchestrator:
                 await self._speak_turn(reply, generation=generation)
                 self._record_chat_turn(user_prompt, reply)
                 return
+
+            # her drive (learning/drive.py): the owner's frustration is her pain - kept with the answer it was
+            # about for tonight's self-check, and owned up to on the spot now and then; praise is counted too
+            from learning import drive
+            recent = getattr(self, "_recent", None) or []
+            try:
+                felt = await asyncio.to_thread(drive.feel, user_prompt, recent[-1] if recent else None,
+                                               self.agent_root / "run" / "learning")
+            except Exception:  # noqa: BLE001 - never in the way of the answer
+                felt = ""
+            if felt == "annoyed" and recent and drive.ack_due(getattr(self, "_drive_ack_at", 0.0)):
+                self._drive_ack_at = time.time()
+                LOG.info("[drive] owner annoyed at: %s", recent[-1].get("a", "")[:60])
+                await self._speak_turn(drive.ACK, generation=generation)
 
             # "你现在什么版本" / "汇报一下你的进度": read off the board (learning/selfstatus.py) - not a question
             # for the teacher, not a shell task

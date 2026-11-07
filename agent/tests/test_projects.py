@@ -294,6 +294,15 @@ class RepairTests(unittest.TestCase):
         self.assertEqual((project.load_state(self.pdir)["status"], project.load_proposal(self.pdir)["status"]),
                          ("rejected", "rejected"))
 
+    def test_her_own_words_when_a_repair_ends(self) -> None:
+        learning = self.root / "learning"
+        st = {"slug": "s", "goal": "修好自己：回答太慢", "status": "gave_up", "summary": "找不到慢在哪"}
+        self.assertIn("我不服气，下次换个办法再来", project.repair_notice(st, {"say": "", "missing": []}, learning))
+        project.repair_notice(st, {}, learning)
+        self.assertIn("试了三次还是没修好，靠我自己不行了", project.repair_notice(st, {}, learning))
+        st["status"] = "done"
+        self.assertEqual(project.repair_notice(st, {"say": "主人，回答慢的问题修好了。"}, learning), "主人，回答慢的问题修好了。")
+
     def test_check_yourself_starts_a_review(self) -> None:
         from learning import selfreview
         with mock.patch.object(selfreview, "start_unit", lambda: ""):

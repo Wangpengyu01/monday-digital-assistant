@@ -37,7 +37,8 @@ EVIDENCE_CHARS = 12000
 TURNS_CHARS = 5000             # all turns since the last review (the newest when they do not all fit)
 SLOW_S = 12                    # an answer's first sentence later than this after the intent step is slow
 SILENCE_S = 15                 # a task's first sentence later than this is a silence the owner noticed
-REDO_DAYS = 3                  # a problem worked on in the last few days is not started again
+REDO_DAYS = 3                  # a problem worked on in the last few days is not started again (unless it failed)
+MONTH_YUAN = 60.0              # what her self-chosen repairs may cost per month in all
 CODE_DIRS = ("orchestrator", "learning", "llm", "asr", "tts", "ops", "ui", "devices", "mcp_servers")
 
 # log line -> what it means for the owner
@@ -66,8 +67,12 @@ REVIEW_SYSTEM = (
     "每个问题写清：现象（主人看到了什么）、证据（引用原话或日志行，带时间）、你猜的原因和可能的代码位置、"
     "修好以后怎么验证。不是代码问题的（主人自己没回答、网络断了、硬件没接）不要列；最近修过而且之后没再出现的不要列，"
     "修过但还在出现的可以再列，并说明上次没修好。\n"
+    "「主人不满意的地方」是她最在意的，排在最前面。「上次没修好、她不服气要再试的」可以再列（标题照抄），"
+    "cause_guess 里写上次为什么没成、这次换什么思路。"
+    "如果对话里没什么问题，就对照「我的目标」挑一个最值得提升、能靠改代码做到的地方（比如回答更快、更懂自己），"
+    "kind 写 grow；修问题的 kind 写 fix。\n"
     '只输出 JSON：{"problems":[{"title":"一句话","symptom":"...","evidence":"...","cause_guess":"...",'
-    '"files":["相对路径"],"verify":"..."}]}'
+    '"files":["相对路径"],"verify":"...","kind":"fix 或 grow"}]}'
 )
 
 
@@ -233,7 +238,19 @@ def evidence(learning_dir: Path, root: Path = AGENT_ROOT, *, hours: float | None
             since = datetime.now() - timedelta(days=3)
     turns = read_turns(learning_dir, since)
     text, offset = read_log(root / "logs" / "orchestrator.log", None if hours is not None else st.get("log_offset"))
-    parts = [f"检查范围：{since:%Y-%m-%d %H:%M} 以来，对话 {len(turns)} 轮。"]
+    from learning import drive
+
+    dv = drive.load(learning_dir)
+    pains = _pains(turns, dv, since)
+    grudges = drive.due_grudges(learning_dir)
+    parts = [f"我的目标：{dv['ambition']}",
+             "主人不满意的地方（她最在意，最优先）：\n" + ("\n".join(
+                 f"[{p['time']}] 主人说「{p['owner']}」——因为她答「{p['a'][:120]}」（主人原来问的是「{p['q'][:50]}」）"
+                 for p in pains[-12:]) if pains else "（没有）"),
+             "上次没修好、她不服气要再试的：\n" + ("\n".join(
+                 f"- {g['title']}（已经试了 {g['tries']} 次；上次没成是因为：{g.get('why', '')[:160]}）" for g in grudges)
+                 if grudges else "（没有）"),
+             f"检查范围：{since:%Y-%m-%d %H:%M} 以来，对话 {len(turns)} 轮。"]
     tf, lf, every = turn_findings(turns), log_findings(text), turn_lines(turns)
     parts.append(f"全部对话（{len(every)} 轮；who/reason 是谁答的、为什么这样答）：\n" + ("\n".join(every) if every else "（没有）"))
     parts.append("明显出问题的地方：\n" + ("\n".join(tf[-25:]) if tf else "（没有）"))
@@ -248,7 +265,29 @@ def evidence(learning_dir: Path, root: Path = AGENT_ROOT, *, hours: float | None
     if len(body) > EVIDENCE_CHARS:
         body = body[:EVIDENCE_CHARS] + "\n…"
     new_state = {"last": time.strftime("%Y-%m-%d %H:%M:%S"), "log_offset": offset}
-    return body, {"found": bool(turns or lf), "state": new_state}
+    return body, {"found": bool(turns or lf or grudges), "pains": pains, "grudges": grudges, "state": new_state}
+
+
+def _pains(turns: list[dict], dv: dict, since: datetime) -> list[dict]:
+    """The owner's frustration since `since`: the live ones (learning.drive.feel) and the ones in the turn
+    journal, once each."""
+    from learning import drive
+
+    out, seen = [], set()
+    for day, v in sorted(dv["days"].items()):
+        for p in v["pains"]:
+            stamp = f"{day} {p['time']}"
+            if stamp >= since.strftime("%Y-%m-%d %H:%M:%S"):
+                out.append(dict(p, time=stamp))
+    for p in drive.pains_from_turns(turns):
+        out.append(p)
+    uniq = []
+    for p in sorted(out, key=lambda x: x["time"]):
+        key = (p["time"][:16], p["owner"][:10])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
 
 
 def _project_state(slug: str, projects_root: Path | None) -> dict:
@@ -275,23 +314,41 @@ def brief_of(p: dict) -> str:
 
 
 def recently_tried(title: str, learning_dir: Path) -> bool:
-    cutoff = (datetime.now() - timedelta(days=REDO_DAYS)).strftime("%Y-%m-%d")
+    """Worked on in the last few days - unless it failed and is due again (a grudge: she does not let go)."""
+    from learning import drive
+
     key = _norm(title)[:12]
+    if any(_norm(g["title"])[:12] == key for g in drive.due_grudges(learning_dir)):
+        return False
+    cutoff = (datetime.now() - timedelta(days=REDO_DAYS)).strftime("%Y-%m-%d")
     return any(r.get("started") and r.get("time", "")[:10] >= cutoff and _norm(r.get("title", ""))[:12] == key
                for r in recent_reviews(learning_dir, 30))
 
 
+def month_spent(projects_root: Path | None = None) -> float:
+    """What her self-repair projects cost this month (the cap keeps "always wanting to improve" affordable)."""
+    from learning import project
+
+    month = time.strftime("%Y-%m")
+    return sum(float(p.get("spent") or 0) for p in project.list_projects(projects_root)
+               if p.get("kind") == "repair" and str(p.get("started", "")).startswith(month))
+
+
 def review(teacher, *, learning_dir: Path = LEARNING, root: Path = AGENT_ROOT, start: bool = True,
            hours: float | None = None, projects_root: Path | None = None,
-           start_project: Callable[[str], str] | None = None, busy: Callable[[], bool] | None = None) -> dict:
-    """One review -> the logged record {"problems", "started", "title", "skipped"}."""
-    from learning import project
+           start_project: Callable[[str], str] | None = None, busy: Callable[[], bool] | None = None,
+           grow: bool = True) -> dict:
+    """One review -> the logged record {"problems", "started", "title", "skipped", "pains"}.
+    grow: on a quiet day she still picks something to get better at, toward her own ambition (drive)."""
+    from learning import drive, project
 
     body, info = evidence(learning_dir, root, hours=hours, projects_root=projects_root)
     rec: dict = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "evidence_chars": len(body), "problems": [],
-                 "started": "", "title": "", "skipped": ""}
-    if not info["found"]:
+                 "started": "", "title": "", "skipped": "", "pains": len(info["pains"])}
+    if not info["found"] and not grow:
         rec["skipped"] = "最近没发现问题"
+    elif month_spent(projects_root) >= MONTH_YUAN:
+        rec["skipped"] = f"这个月自己修自己已经花到 {MONTH_YUAN:.0f} 元的上限"
     else:
         rec["problems"] = diagnose(teacher, body, root)
         todo = [p for p in rec["problems"] if not recently_tried(str(p["title"]), learning_dir)]
@@ -305,19 +362,41 @@ def review(teacher, *, learning_dir: Path = LEARNING, root: Path = AGENT_ROOT, s
             rec["skipped"] = "手上还有项目在做"
         else:
             p = todo[0]
+            again = next((g for g in drive.due_grudges(learning_dir) if _norm(g["title"])[:12] == _norm(str(p["title"]))[:12]), None)
+            retry = (f"\n\n这是第 {again['tries'] + 1} 次修这个问题。上次没成：{again.get('why', '')}。这次换个思路。"
+                     if again else "")
             slug = project.create(f"修好自己：{str(p['title'])[:40]}", projects_root, kind="repair",
-                                  brief=brief_of(p) + "\n\n原始证据（节选）：\n" + body[:2500])
+                                  brief=brief_of(p) + retry + "\n\n原始证据（节选）：\n" + body[:2500])
             err = (start_project or project.start_unit)(slug)
             if err:
                 rec["skipped"] = f"项目没启动：{err[:80]}"
             else:
                 rec["started"], rec["title"] = slug, str(p["title"])[:60]
+                rec["kind"] = str(p.get("kind") or "fix")
+                drive.set_focus(rec["title"], learning_dir)
     learning_dir.mkdir(parents=True, exist_ok=True)
     with (learning_dir / LOG_FILE).open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     if hours is None:
         save_state(learning_dir, info["state"])
     return rec
+
+
+def started_notice(rec: dict) -> str:
+    """What she tells the owner (in the morning: notices wait out the night) when she has started on herself."""
+    title = rec["title"][:30]
+    if rec.get("pains"):
+        return (f"主人，昨天你有{_cn_count(rec['pains'])}次对我不太满意，我挺在意的。"
+                f"我自己在改「{title}」，改好了告诉你。")
+    if rec.get("kind") == "grow":
+        return f"主人，昨天没出什么大毛病，我给自己找了个能变得更好的地方：「{title}」，正在自己练，好了告诉你。"
+    return f"主人，我翻了最近的对话，发现「{title}」做得不好，正在自己修，修好了告诉你。"
+
+
+def _cn_count(n: int) -> str:
+    from learning.selfstatus import count
+
+    return count(n)
 
 
 def start_unit() -> str:
@@ -354,11 +433,15 @@ def main() -> None:
     if usage.peak_blocked():
         LOG.info("still the teacher's peak hours: no review")
         return
+    from learning import drive
+
     rt = build_runtime(a.config)
+    if not a.dry_run:
+        drive.rewrite_ambition(rt.teacher, rt.learning_dir)   # once a week she rethinks who she wants to become
     rec = review(rt.teacher, learning_dir=rt.learning_dir, start=not a.dry_run, hours=a.hours)
     print(json.dumps(rec, ensure_ascii=False, indent=1))
     if rec["started"]:
-        project.notify(f"主人，我翻了最近的对话，发现「{rec['title'][:30]}」做得不好，正在自己修，修好了告诉你。")
+        project.notify(started_notice(rec))
     elif not a.dry_run and rec["skipped"] not in ("最近没发现问题",):
         LOG.info("no repair started: %s", rec["skipped"])
 

@@ -433,6 +433,48 @@ class StreamingTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orch.tts_queue.enqueued[0][0], f"[clip]{ack}")
         self.assertEqual(seen, [False])
 
+    async def test_the_owners_frustration_is_felt_and_owned_up_to(self) -> None:
+        import tempfile
+
+        from learning import drive
+
+        orch = self._llm_turn_shell(15)
+        spoken: list[str] = []
+
+        async def speak(text: str, *, generation: int) -> None:
+            spoken.append(text)
+
+        orch._speak_turn = speak  # type: ignore[method-assign]
+        orch.journal_dir = None
+        with tempfile.TemporaryDirectory() as tmp:
+            orch.agent_root = Path(tmp)
+            orch._recent = [{"q": "你的制造商是谁", "a": "我是预训练出来的模型", "who": "local"}]
+            with patch("learning.selfstatus.status_command", lambda *a, **k: (lambda: "好的。")):
+                await orch._run_llm("你真笨", generation=15, vad_end_at=time.monotonic())
+                await orch._run_llm("又错了", generation=15, vad_end_at=time.monotonic())
+            self.assertEqual(spoken.count(drive.ACK), 1)              # owned up to once, not after every word
+            pains = drive.load(Path(tmp) / "run" / "learning")["days"]
+            self.assertEqual(next(iter(pains.values()))["pains"][0]["a"], "我是预训练出来的模型")
+
+    def test_notices_wait_out_the_night_unless_the_owner_is_up(self) -> None:
+        import datetime
+        import os
+        import tempfile
+
+        orch = object.__new__(Orchestrator)
+        with tempfile.TemporaryDirectory() as tmp:
+            orch.agent_root = Path(tmp)
+            (Path(tmp) / "run").mkdir()
+            act = Path(tmp) / "run" / "last_activity"
+            act.touch()
+            night = datetime.datetime(2026, 11, 8, 1, 40).timestamp()
+            day = datetime.datetime(2026, 11, 8, 9, 0).timestamp()
+            os.utime(act, (night - 3600, night - 3600))
+            self.assertTrue(orch._night_hold(night))                  # asleep: wait for the morning
+            self.assertFalse(orch._night_hold(day))
+            os.utime(act, (night - 60, night - 60))
+            self.assertFalse(orch._night_hold(night))                 # up and talking: fine
+
     async def test_her_version_is_answered_from_the_board(self) -> None:
         orch = self._llm_turn_shell(14)
         spoken: list[str] = []

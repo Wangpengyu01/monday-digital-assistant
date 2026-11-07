@@ -349,6 +349,7 @@ body.lite .glass, body.lite header, body.lite .panel, body.lite .toast { backdro
             </div>
             <div class="sec">项目（她自己做，做完或卡住了会说）</div>
             <div class="row" style="gap:8px;margin:4px 0 8px"><input type="search" id="pjGoal" placeholder="给她一个目标，比如：写一个……"><button class="btn sm" id="pjStart">开始</button></div>
+            <div id="pjDrive" style="display:none;margin:4px 0 8px;line-height:1.6"></div>
             <div id="pjProposal" style="display:none;border:1px solid var(--line,#ccc);border-radius:8px;padding:8px;margin:6px 0">
               <div id="pjPropTitle" style="font-weight:600"></div>
               <div id="pjPropWhy" style="margin:4px 0"></div>
@@ -859,6 +860,17 @@ async function loadProjects() {
     const say = { new: ["排队", "no"], running: ["在做", "no"], done: ["做完", "ok"], gave_up: ["没做成", "no"], over_budget: ["钱用完", "no"],
                   out_of_steps: ["步数用完", "no"], too_big: ["太大", "no"], failed: ["出错", "no"], stopped: ["停了", "no"],
                   proposed: ["等你批准", "no"], applying: ["上线中", "no"], rejected: ["没批准", "no"] };
+    const dv = d.drive, db = $("pjDrive");   // her drive: what she wants to become and how far she is
+    db.style.display = dv ? "" : "none";
+    if (dv) {
+      db.textContent = "";
+      const line = (label, text) => { const r = el("div"); r.append(el("b", null, label), el("span", null, text)); db.append(r); };
+      line("她的目标：", dv.ambition);
+      line("这一周：", `你夸了她 ${dv.pleased} 次，不满意 ${dv.annoyed} 次` + (dv.focus ? `；正在改：${dv.focus}` : ""));
+      if (dv.pains.length) line("让她在意的：", dv.pains.map(p => `你说「${p.owner}」（她答「${p.a}」）`).join("；"));
+      if (dv.wins.length) line("自己修好的：", dv.wins.join("；"));
+      if (dv.grudges.length) line("还没服气的：", dv.grudges.join("；"));
+    }
     const pp = d.proposal, box = $("pjProposal");
     box.style.display = pp ? "" : "none";
     if (pp) {

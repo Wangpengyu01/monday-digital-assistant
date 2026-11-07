@@ -488,6 +488,23 @@ def retrospective(pdir: Path, st: dict, ctx: Ctx, learning_dir: Path = LEARNING)
     return out
 
 
+def repair_notice(st: dict, retro: dict, learning_dir: Path = LEARNING) -> str:
+    """A repair of herself ended: a win is told in her own words; a failure becomes a grudge (learning.drive)
+    she says she will come back to."""
+    from learning import drive
+
+    kind = drive.record_outcome(st, learning_dir, say=retro.get("say", ""), missing=retro.get("missing") or [])
+    title = str(st.get("goal", "")).replace("修好自己：", "")[:30]
+    if kind == "win":
+        return "主人，" + (retro.get("say") or f"「{title}」我修好了。").removeprefix("主人，")[:200]
+    g = next((x for x in drive.load(learning_dir)["grudges"] if x["title"] == str(st.get("goal", "")).replace("修好自己：", "")[:60]), None)
+    if g and g["tries"] >= drive.MAX_TRIES:
+        from learning.selfstatus import count
+        return (f"主人，「{title}」我试了{count(g['tries'])}次还是没修好，靠我自己不行了，得请你或者开发的人帮我看看："
+                f"{str(st.get('summary', ''))[:80]}")
+    return f"主人，「{title}」我这次没修好：{str(st.get('summary', ''))[:80]}。我不服气，下次换个办法再来。"
+
+
 def notify(text: str, notices: Path = NOTICES) -> None:
     """Queue a sentence for the orchestrator to say when it's idle (orchestrator _notice_loop)."""
     notices.mkdir(parents=True, exist_ok=True)
@@ -721,6 +738,8 @@ def main() -> None:
         pdir = projbox.project_dir(a.slug)
         res = apply_proposal(pdir, board_ctx(a.config))
         st = load_state(pdir)
+        from learning import drive
+        drive.record_outcome(st, LEARNING, say=st.get("summary", ""))
         notify(f"主人，你批准的修改「{st['goal'][:20]}」" + ("上线了，测试和考卷都没变差。" if res.get("ok") else
                                                            f"没上成，已经自动退回：{str(res.get('reason', ''))[:60]}"))
         print(json.dumps(res, ensure_ascii=False, default=str))
@@ -734,6 +753,8 @@ def main() -> None:
         if st["status"] == "proposed":
             notify(f"主人，我想改一下我自己：{st['goal'][:24]}。{st.get('summary', '')[:120]}"
                    "这次要动受保护的文件，改动在网页的项目里能看。你说「批准修改」我就上线，说「不用改」就算了。")
+        elif st.get("kind") == "repair":
+            notify(repair_notice(st, retro))
         else:
             notify(f"主人，项目「{st['goal'][:20]}」{STATUS_SAY.get(st['status'], st['status'])}。{retro['say'][:120]}")
         print(json.dumps({k: st.get(k) for k in ("slug", "status", "steps", "spent", "summary")}, ensure_ascii=False))

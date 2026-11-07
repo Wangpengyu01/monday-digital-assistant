@@ -346,6 +346,15 @@ def projects_info() -> dict[str, Any]:
         out["proposal"] = {"slug": waiting["slug"], "goal": waiting["goal"], "why": prop.get("why", ""),
                            "say": prop.get("say", ""), "files": [f["dst"] for f in prop.get("files") or []],
                            "diff": diff.read_text(encoding="utf-8", errors="replace")[:20000] if diff.is_file() else ""}
+    try:   # her drive (learning/drive.py): what she wants to become and how far she is
+        from learning import drive
+        d, w = drive.load(), drive.week_summary()
+        out["drive"] = {"ambition": d["ambition"], "focus": d["focus"], "annoyed": w["annoyed"], "pleased": w["pleased"],
+                        "pains": [{"owner": p["owner"], "a": p["a"][:80]} for p in w["pains"][-3:]],
+                        "wins": [x["title"] for x in d["wins"][-3:]][::-1],
+                        "grudges": [f"{g['title']}（试了 {g['tries']} 次）" for g in d["grudges"]][:3]}
+    except Exception:  # noqa: BLE001 - the page works without it
+        pass
     return out
 
 

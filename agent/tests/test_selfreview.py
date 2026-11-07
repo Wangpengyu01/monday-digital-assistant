@@ -13,7 +13,7 @@ AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))
 
-from learning import project, selfreview  # noqa: E402
+from learning import drive, project, selfreview  # noqa: E402
 
 # what the log looked like on 2026-11-07 when she could not say her own version
 LOG = """17:48:02 INFO [llm] ack before answer: 嗯嗯，让我想一想，
@@ -122,13 +122,51 @@ class SelfReviewTests(unittest.TestCase):
         rec = self.review(Teacher([dict(PROBLEM, title="第三个问题")]), hours=24, start=False)
         self.assertEqual((rec["started"], len(rec["problems"])), ("", 1))
 
-    def test_a_quiet_stretch_costs_nothing(self) -> None:
+    def test_a_quiet_stretch(self) -> None:
         self.review(Teacher([PROBLEM]), start=False)            # moves the saved place to the end
-        t = Teacher([PROBLEM])
-        (self.learning / "turns").joinpath("x").mkdir()
         time.sleep(1.1)
-        rec = self.review(t)
+        t = Teacher([PROBLEM])
+        rec = self.review(t, grow=False)
         self.assertEqual((rec["skipped"], t.calls), ("最近没发现问题", []))
+        # by default she still wants to get better: something toward her own ambition
+        grow = dict(PROBLEM, title="回答再快一点", kind="grow")
+        t = Teacher([grow])
+        rec = self.review(t)
+        self.assertEqual((rec["title"], rec["kind"]), ("回答再快一点", "grow"))
+        self.assertIn("我的目标：成为主人离不开的全栈助理", t.calls[0])
+        self.assertIn("给自己找了个能变得更好的地方", selfreview.started_notice(rec))
+        self.assertEqual(drive.load(self.learning)["focus"], "回答再快一点")
+
+    def test_the_owners_frustration_comes_first(self) -> None:
+        drive.feel("你真笨", {"q": "你的制造商是谁", "a": "我是预训练出来的模型"}, self.learning)
+        body, info = selfreview.evidence(self.learning, self.root)
+        pains = body.split("主人不满意的地方")[1].split("上次没修好")[0]
+        self.assertIn("主人说「你真笨」——因为她答「我是预训练出来的模型」", pains)
+        rec = self.review(Teacher([PROBLEM]))
+        self.assertEqual(rec["pains"], 1)
+        self.assertIn("你有一次对我不太满意", selfreview.started_notice(rec))
+
+    def test_what_she_failed_at_she_tries_again_another_way(self) -> None:
+        rec = self.review(Teacher([PROBLEM]))
+        drive.record_outcome({"slug": rec["started"], "goal": "修好自己：问她版本号答不上来", "status": "gave_up",
+                              "summary": "找不到版本信息在哪"}, self.learning)
+        d = drive.load(self.learning)
+        d["grudges"][0]["last_try"] = "2000-01-01"            # a day has passed
+        drive.save(d, self.learning)
+        rec = self.review(Teacher([PROBLEM]), hours=24)
+        self.assertTrue(rec["started"])                        # not skipped as "recently tried"
+        brief = (self.projects / rec["started"] / "brief.md").read_text(encoding="utf-8")
+        self.assertIn("这是第 2 次修这个问题。上次没成：找不到版本信息在哪", brief)
+
+    def test_a_monthly_cap(self) -> None:
+        rec = self.review(Teacher([PROBLEM]))
+        st = project.load_state(self.projects / rec["started"])
+        st["spent"] = selfreview.MONTH_YUAN
+        project.save_state(self.projects / rec["started"], st)
+        t = Teacher([dict(PROBLEM, title="别的")])
+        rec = self.review(t, hours=24)
+        self.assertIn("上限", rec["skipped"])
+        self.assertEqual(t.calls, [])
 
 
 if __name__ == "__main__":
