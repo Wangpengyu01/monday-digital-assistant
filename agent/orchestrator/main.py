@@ -2330,6 +2330,14 @@ class Orchestrator:
                 self._last_qa = (user_prompt, learn_route.memory_answer)
                 return
             memory_ctx = await asyncio.to_thread(memory.context_for, user_prompt)
+            try:   # 发散 (learning/associate.py): what the things he mentions connect to, an idea they trigger
+                from learning import associate
+                assoc = await asyncio.to_thread(associate.context_for, user_prompt, self.agent_root / "run" / "learning")
+            except Exception:  # noqa: BLE001 - never in the way of the answer
+                assoc = ""
+            if assoc:
+                LOG.info("[associate] %s", assoc.splitlines()[0][:80])
+                memory_ctx = f"{memory_ctx}\n{assoc}".strip()
 
         ack_played = intent_ack_played
         if not ack_played and not is_companion and getattr(self, "ack_enabled", False):

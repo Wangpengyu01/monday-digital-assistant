@@ -911,6 +911,10 @@ async function loadProjects() {
       if (dv.pains.length) line("让她在意的：", dv.pains.map(p => `你说「${p.owner}」（她答「${p.a}」）`).join("；"));
       if (dv.wins.length) line("自己修好的：", dv.wins.join("；"));
       if (dv.grudges.length) line("还没服气的：", dv.grudges.join("；"));
+      if (dv.assoc && (dv.assoc.nodes || dv.assoc.ideas.length)) {
+        line("发散：", `她脑子里记着 ${dv.assoc.nodes} 样东西、${dv.assoc.edges} 条关联`);
+        if (dv.assoc.ideas.length) line("她最近琢磨到的：", dv.assoc.ideas.join("；"));
+      }
       if (dv.spar && dv.spar.turns) line("陪练：", `${dv.spar.day.slice(5)} 老师扮成你聊了 ${dv.spar.turns} 句，她答好 ${dv.spar.ok} 句` +
         `（${Math.round(100 * dv.spar.ok / dv.spar.turns)}%），攒下训练题 ${dv.spar.kept} 条` + (dv.spar.kinds.length ? `；常犯：${dv.spar.kinds.join("、")}` : ""));
     }

@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly 发散 at 02:30 (between the 01:30 self-check and the 03:00 sparring)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

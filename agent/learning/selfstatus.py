@@ -187,6 +187,9 @@ def status_command(text: str, *, doing: str = "", root: Path = AGENT_ROOT, conf:
     """"你现在什么版本" / "汇报一下你的进度" -> a function returning what to say; anything else -> None."""
     t = re.sub(r"\s+", "", text or "")
     from learning import drive
+    from learning import associate
+    if associate.wants_ideas(t):   # "你最近想到什么了": what she came to while wandering at night
+        return lambda: associate.say_ideas(learning_dir)
     if drive.wants_drive(t):   # "你在努力什么 / 你最近有进步吗": her ambition, the owner's mood, wins and grudges
         return lambda: drive.say(learning_dir)
     version, progress = wants_version(t), wants_progress(t)

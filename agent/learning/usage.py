@@ -33,7 +33,7 @@ TAGS = {  # __main__ module -> job name shown on the page
     "learning.school": "上课", "learning.practice": "练习", "learning.distill": "蒸馏",
     "learning.reflect": "每晚反思", "learning.owner": "了解主人", "learning.inbox": "读文件",
     "orchestrator.main": "对话", "learning.lora_prep": "整理训练数据", "learning.selftune": "自我优化",
-    "learning.selfreview": "自我检查", "learning.spar": "陪练",
+    "learning.selfreview": "自我检查", "learning.spar": "陪练", "learning.associate": "发散",
 }
 
 

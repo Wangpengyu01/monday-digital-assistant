@@ -353,6 +353,10 @@ def projects_info() -> dict[str, Any]:
                         "pains": [{"owner": p["owner"], "a": p["a"][:80]} for p in w["pains"][-3:]],
                         "wins": [x["title"] for x in d["wins"][-3:]][::-1],
                         "grudges": [f"{g['title']}（试了 {g['tries']} 次）" for g in d["grudges"]][:3]}
+        from learning import associate
+        g = associate.load()   # 发散 (learning/associate.py): her association graph and what she came to at night
+        out["drive"]["assoc"] = {"nodes": len(g["nodes"]), "edges": len(g["edges"]),
+                                 "ideas": [i["idea"] for i in g["ideas"][-3:]][::-1]}
         from learning import spar
         last = spar.latest()
         if last:   # 陪练 (learning/spar.py): the teacher plays the owner, her local model answers
