@@ -349,6 +349,12 @@ body.lite .glass, body.lite header, body.lite .panel, body.lite .toast { backdro
             </div>
             <div class="sec">项目（她自己做，做完或卡住了会说）</div>
             <div class="row" style="gap:8px;margin:4px 0 8px"><input type="search" id="pjGoal" placeholder="给她一个目标，比如：写一个……"><button class="btn sm" id="pjStart">开始</button></div>
+            <div id="pjProposal" style="display:none;border:1px solid var(--line,#ccc);border-radius:8px;padding:8px;margin:6px 0">
+              <div id="pjPropTitle" style="font-weight:600"></div>
+              <div id="pjPropWhy" style="margin:4px 0"></div>
+              <details><summary id="pjPropFiles"></summary><pre id="pjPropDiff" style="max-height:320px;overflow:auto;font-size:12px;white-space:pre"></pre></details>
+              <div class="row" style="gap:8px;margin-top:6px"><button class="btn sm" id="pjApprove">批准修改</button><button class="btn sm" id="pjReject">不用改</button></div>
+            </div>
             <div id="pjList"></div>
             <div id="pjSteps"></div>
             <div class="school-progress">
@@ -834,11 +840,34 @@ $("pjStart").onclick = async (e) => {
   e.currentTarget.disabled = false;
   loadProjects();
 };
+async function answerProposal(yes, btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/project/answer", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                   body: JSON.stringify({ slug: $("pjProposal").dataset.slug, yes }) });
+    const d = await r.json().catch(() => ({}));
+    toast(d.say || "没成功");
+  } catch (err) { toast(err.message); }
+  btn.disabled = false;
+  loadProjects();
+}
+$("pjApprove").onclick = (e) => answerProposal(true, e.currentTarget);
+$("pjReject").onclick = (e) => answerProposal(false, e.currentTarget);
 async function loadProjects() {
   try {
     const d = await api("/api/projects");
     const say = { new: ["排队", "no"], running: ["在做", "no"], done: ["做完", "ok"], gave_up: ["没做成", "no"], over_budget: ["钱用完", "no"],
-                  out_of_steps: ["步数用完", "no"], too_big: ["太大", "no"], failed: ["出错", "no"], stopped: ["停了", "no"] };
+                  out_of_steps: ["步数用完", "no"], too_big: ["太大", "no"], failed: ["出错", "no"], stopped: ["停了", "no"],
+                  proposed: ["等你批准", "no"], applying: ["上线中", "no"], rejected: ["没批准", "no"] };
+    const pp = d.proposal, box = $("pjProposal");
+    box.style.display = pp ? "" : "none";
+    if (pp) {
+      box.dataset.slug = pp.slug;
+      $("pjPropTitle").textContent = "她想改自己（要你批准）：" + pp.goal;
+      $("pjPropWhy").textContent = pp.say + (pp.why && pp.why !== pp.say ? "（" + pp.why + "）" : "");
+      $("pjPropFiles").textContent = "看改动：" + pp.files.join("、");
+      $("pjPropDiff").textContent = pp.diff || "（没有改动内容）";
+    }
     const pl = $("pjList"); pl.textContent = "";
     for (const p of d.projects || []) {
       const row = el("div", "lesson"), v = say[p.status] || [p.status, "no"];

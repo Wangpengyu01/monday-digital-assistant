@@ -36,6 +36,11 @@ PROTECTED = (
     "learning/credentials.py", "learning/grants.py", "ops/", "config/", "systemd/", "run/", "logs/",
     "tests/test_selftune.py", "tests/test_sandbox.py", "tests/test_projects.py", "tests/test_agent.py",
 )
+# protected files she may still change if the owner says yes to her proposal ("批准修改", learning.project
+# propose): the agent loop and its permission gate (2026-11-07: three of five fixes to her dumb answers were
+# in agent.py), the teacher client. Everything else protected - the sandboxes, this file, the project runner,
+# the exam and her rule guards, the budget, snapshots, config, units - stays out of her reach even then.
+PROPOSABLE = ("learning/agent.py", "learning/teacher.py", "tests/test_agent.py")
 MAX_FILES = 40
 MAX_BYTES = 512 * 1024
 EXAM_SLACK = 2
@@ -46,8 +51,13 @@ LOG_FILE = "deliveries.jsonl"
 _FAIL = re.compile(r"^(FAIL|ERROR): (\S+) \(([\w.]+)\)", re.M)
 
 
-def check(files: list[dict], root: Path = AGENT_ROOT) -> list[str]:
-    """files: [{"src": Path, "dst": "path relative to the agent root"}] -> problems (empty: may go in)."""
+def is_protected(dst: str) -> bool:
+    return any(dst == x or dst.startswith(x) for x in PROTECTED)
+
+
+def check(files: list[dict], root: Path = AGENT_ROOT, allow: tuple[str, ...] = ()) -> list[str]:
+    """files: [{"src": Path, "dst": "path relative to the agent root"}] -> problems (empty: may go in).
+    allow: protected paths the owner approved for this delivery (only ever PROPOSABLE ones)."""
     problems = []
     if not files:
         problems.append("没有要上线的文件")
@@ -59,7 +69,7 @@ def check(files: list[dict], root: Path = AGENT_ROOT) -> list[str]:
         if not dst or ".." in p.parts or p.is_absolute():
             problems.append(f"路径不对：{dst!r}")
             continue
-        if any(dst == x or dst.startswith(x) for x in PROTECTED):
+        if is_protected(dst) and not (dst in allow and dst in PROPOSABLE):
             problems.append(f"受保护，不能改：{dst}")
         src = Path(f["src"])
         if not src.is_file():
@@ -108,7 +118,7 @@ def deliver(files: list[dict], why: str, *, project: str, learning_dir: Path,
             exam_score: Callable[[], int | None], wait_quiet: Callable[[], bool],
             root: Path = AGENT_ROOT, tests: Callable[[], set[str] | None] = failing_tests,
             snapshot: Callable[[str, str], str] | None = None, restore: Callable[[str], None] | None = None,
-            restart_units: Callable[[list[str]], str] = restart) -> dict:
+            restart_units: Callable[[list[str]], str] = restart, allow: tuple[str, ...] = ()) -> dict:
     """-> {"ok": bool, "stage": ..., "why": ...}. Never leaves a half-applied change behind."""
     if snapshot is None or restore is None:
         sys.path.insert(0, str(root))
@@ -124,7 +134,7 @@ def deliver(files: list[dict], why: str, *, project: str, learning_dir: Path,
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return rec
 
-    problems = check(files, root)
+    problems = check(files, root, allow)
     if problems:
         return log(ok=False, stage="check", reason="；".join(problems)[:300])
     units = services_for([f["dst"] for f in files])

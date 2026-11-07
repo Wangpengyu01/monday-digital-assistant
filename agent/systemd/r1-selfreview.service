@@ -1,0 +1,17 @@
+[Unit]
+Description=星期一 reads her own recent conversations and logs and starts a repair project for the worst problem
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=youyeetoo
+Group=youyeetoo
+WorkingDirectory=/userdata/agent
+Environment=PYTHONPATH=/userdata/agent
+Environment=MONDAY_USAGE_TAG=自我检查
+EnvironmentFile=-/userdata/secrets/deepseek.env
+ExecStart=/usr/bin/python3 -m learning.selfreview
+StandardOutput=append:/userdata/agent/logs/selfreview.log
+StandardError=append:/userdata/agent/logs/selfreview.log
+TimeoutStartSec=infinity
+Nice=5

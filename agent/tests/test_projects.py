@@ -199,6 +199,111 @@ class VoiceCommandTests(unittest.TestCase):
         self.assertEqual(project.load_state(self.root / self.started[0])["status"], "stopped")
 
 
+class RepairTests(unittest.TestCase):
+    """Repair projects (kind "repair", started by learning.selfreview) and proposals the owner approves."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.root, self.agent = base / "projects", base / "agent"
+        for rel, text in (("learning/agent.py", "A = 1\n"), ("orchestrator/main.py", "M = 1\n"), ("learning/deliver.py", "D\n")):
+            (self.agent / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.agent / rel).write_text(text, encoding="utf-8")
+        self.slug = project.create("修好自己：老师的回复解析不了", self.root, kind="repair",
+                                   brief="现象：老师分两段发 JSON，她说「老师给的步骤我没看懂」")
+        self.pdir = self.root / self.slug
+        work = self.pdir / "work" / "agent"
+        for rel, text in (("learning/agent.py", "A = 2\n"), ("orchestrator/main.py", "M = 2\n"), ("learning/deliver.py", "D2\n")):
+            (work / rel).parent.mkdir(parents=True, exist_ok=True)
+            (work / rel).write_text(text, encoding="utf-8")
+        self.systems: list[str] = []
+        self.patch = mock.patch.object(project, "AGENT_ROOT", self.agent)
+        self.patch.start()
+
+    def tearDown(self) -> None:
+        self.patch.stop()
+        self._tmp.cleanup()
+
+    def run_script(self, script: list[dict], slug: str | None = None) -> dict:
+        w = FakeWorld(script)
+        ctx = w.ctx()
+        plan = ctx.plan
+
+        def watching(system, user):
+            self.systems.append(system)
+            self.user = user
+            return plan(system, user)
+        ctx.plan = watching
+        return project.run(self.root / (slug or self.slug), ctx)
+
+    def propose_step(self, *dsts: str) -> dict:
+        return {"tool": "propose", "why": "合并分两段的 JSON", "say": "老师的回复分两段时我读不懂，改好了。",
+                "files": [{"src": f"agent/{d}", "dst": d} for d in dsts]}
+
+    def test_a_repair_project_gets_the_repair_rules_and_the_problem(self) -> None:
+        self.run_script([{"tool": "give_up", "why": "x"}])
+        self.assertIn("这次的项目是修你自己", self.systems[0])
+        self.assertIn("老师给的步骤我没看懂", self.user)
+        other = project.create("写个小工具", self.root)
+        self.run_script([{"tool": "give_up", "why": "x"}], other)
+        self.assertNotIn("修你自己", self.systems[-1])
+
+    def test_a_protected_change_is_handed_to_the_owner(self) -> None:
+        st = self.run_script([self.propose_step("learning/agent.py", "orchestrator/main.py")])
+        self.assertEqual(st["status"], "proposed")
+        prop = project.load_proposal(self.pdir)
+        self.assertEqual((prop["status"], [f["dst"] for f in prop["files"]]), ("pending", ["learning/agent.py", "orchestrator/main.py"]))
+        self.assertEqual((self.pdir / prop["files"][0]["src"]).read_text(encoding="utf-8"), "A = 2\n")
+        diff = (self.pdir / "proposal.diff").read_text(encoding="utf-8")
+        self.assertIn("-A = 1", diff)
+        self.assertIn("+A = 2", diff)
+        self.assertEqual((self.agent / "learning" / "agent.py").read_text(encoding="utf-8"), "A = 1\n")  # nothing applied
+
+    def test_what_even_the_owner_cannot_approve_and_what_needs_no_approval(self) -> None:
+        self.run_script([self.propose_step("learning/deliver.py"), self.propose_step("orchestrator/main.py")])
+        log = project.steps(self.pdir)
+        self.assertIn("不能由你来改", log[0]["result"])
+        self.assertIn("直接用 deliver", log[1]["result"])
+        other = project.create("写个小工具", self.root)
+        self.run_script([self.propose_step("learning/agent.py")], other)
+        self.assertIn("只有修自己的项目", project.steps(self.root / other)[0]["result"])
+
+    def test_the_owner_says_yes_or_no(self) -> None:
+        self.run_script([self.propose_step("learning/agent.py")])
+        started = []
+        cmd = lambda text: project.project_command(text, root=self.root, start=lambda slug: started.append(slug) or "",
+                                                   active=lambda s: False, is_peak=lambda: False)
+        self.assertIsNone(cmd("可以"))                           # a bare "可以" answers agent steps, not proposals
+        self.assertIn("等你批准", cmd("项目做得怎么样")())
+        self.assertIn("这就上线", cmd("批准修改。")())
+        self.assertEqual((started, project.load_state(self.pdir)["status"]), ([self.slug], "applying"))
+        delivered = []
+        ctx = FakeWorld([]).ctx()
+        ctx.deliver = lambda files, why, slug, allow=(): delivered.append((files, allow)) or {"ok": True, "stage": "done"}
+        project.apply_proposal(self.pdir, ctx)
+        files, allow = delivered[0]
+        self.assertEqual(allow, ("learning/agent.py",))
+        self.assertEqual(files[0]["src"].read_text(encoding="utf-8"), "A = 2\n")
+        self.assertEqual(project.load_state(self.pdir)["status"], "done")
+        self.assertIsNone(cmd("批准修改"))                        # nothing is waiting any more
+
+    def test_no_closes_it(self) -> None:
+        self.run_script([self.propose_step("learning/agent.py")])
+        say = project.project_command("不用改了", root=self.root, start=lambda slug: "", active=lambda s: False)()
+        self.assertIn("不上线", say)
+        self.assertEqual((project.load_state(self.pdir)["status"], project.load_proposal(self.pdir)["status"]),
+                         ("rejected", "rejected"))
+
+    def test_check_yourself_starts_a_review(self) -> None:
+        from learning import selfreview
+        with mock.patch.object(selfreview, "start_unit", lambda: ""):
+            say = project.project_command("你去检查一下你自己", root=self.root, active=lambda s: False)()
+        self.assertTrue(say.startswith("好，我去翻翻最近的对话和日志"))
+        for text in ("看看自己哪里傻", "自己修修自己", "修一下你自己"):
+            self.assertIsNotNone(project._REVIEW.search(text), text)
+        self.assertIsNone(project._REVIEW.search("检查一下你自己的服务状态"))      # that one is a task
+
+
 class DeliverTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -224,14 +329,14 @@ class DeliverTests(unittest.TestCase):
         for rel, text in self.saved.items():
             (self.root / rel).write_text(text, encoding="utf-8")
 
-    def go(self, files, *, tests_after=frozenset(), exam=(30, 30), quiet=True):
+    def go(self, files, *, tests_after=frozenset(), exam=(30, 30), quiet=True, allow=()):
         runs = iter([{"tests.old"}, set(tests_after) | {"tests.old"}])
         scores = iter(exam)
         restarted = []
         res = deliver.deliver(files, "新功能", project="p1", learning_dir=self.learning, root=self.root,
                               exam_score=lambda: next(scores), wait_quiet=lambda: quiet, tests=lambda: next(runs),
                               snapshot=self.snapshot, restore=self.restore,
-                              restart_units=lambda units: restarted.append(list(units)) or "")
+                              restart_units=lambda units: restarted.append(list(units)) or "", allow=allow)
         return res, restarted
 
     def files(self):
@@ -259,6 +364,16 @@ class DeliverTests(unittest.TestCase):
     def test_protected_files_are_refused_before_anything_happens(self) -> None:
         for dst in ("learning/agent.py", "learning/exam.py", "config/agent.yaml", "ops/snapshot.py", "../etc/x", "run/x"):
             res, _ = self.go([{"src": self.src / "feature.py", "dst": dst}])
+            self.assertEqual((res["ok"], res["stage"]), (False, "check"), dst)
+
+    def test_owner_approved_proposals_may_touch_only_the_proposable_files(self) -> None:
+        (self.root / "learning").mkdir()
+        (self.root / "learning" / "agent.py").write_text("OLD\n", encoding="utf-8")
+        res, _ = self.go([{"src": self.src / "feature.py", "dst": "learning/agent.py"}], allow=("learning/agent.py",))
+        self.assertTrue(res["ok"])
+        self.assertEqual((self.root / "learning" / "agent.py").read_text(encoding="utf-8"), "NEW\n")
+        for dst in ("learning/deliver.py", "learning/projbox.py", "ops/snapshot.py", "config/agent.yaml"):
+            res, _ = self.go([{"src": self.src / "feature.py", "dst": dst}], allow=(dst,))
             self.assertEqual((res["ok"], res["stage"]), (False, "check"), dst)
 
     def test_waits_for_the_owner_to_be_quiet(self) -> None:

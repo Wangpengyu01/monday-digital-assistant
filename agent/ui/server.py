@@ -338,7 +338,25 @@ def projects_info() -> dict[str, Any]:
                         for h in project.steps(pdir)[-15:]][::-1]
         notes = pdir / "notes.md"
         out["notes"] = notes.read_text(encoding="utf-8")[-1500:] if notes.is_file() else ""
+    waiting = project.pending_proposal()
+    if waiting:   # a repair that touches a protected file: the owner reads the change and says yes or no
+        pdir = project.projbox.project_dir(waiting["slug"])
+        prop = project.load_proposal(pdir)
+        diff = pdir / "proposal.diff"
+        out["proposal"] = {"slug": waiting["slug"], "goal": waiting["goal"], "why": prop.get("why", ""),
+                           "say": prop.get("say", ""), "files": [f["dst"] for f in prop.get("files") or []],
+                           "diff": diff.read_text(encoding="utf-8", errors="replace")[:20000] if diff.is_file() else ""}
     return out
+
+
+def answer_proposal(slug: str, yes: bool) -> dict[str, Any]:
+    """The owner pressed 批准 / 不用改 on the page: same path as saying it."""
+    project = _project_mod()
+    waiting = project.pending_proposal()
+    if not waiting or waiting["slug"] != slug:
+        return {"ok": False, "say": "现在没有等你批准的修改"}
+    say = project.decide(slug, yes)
+    return {"ok": True, "say": say}
 
 
 def start_project(goal: str) -> dict[str, Any]:
@@ -585,6 +603,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 res = start_project(str(self._body_json().get("goal") or ""))
                 self._json(res, 200 if res.get("ok") else 409)
             self._guard(run_project)
+        elif u.path == "/api/project/answer":
+            def run_answer() -> None:
+                b = self._body_json()
+                res = answer_proposal(str(b.get("slug") or ""), bool(b.get("yes")))
+                self._json(res, 200 if res.get("ok") else 409)
+            self._guard(run_answer)
         elif u.path == "/api/owner/answer":
             def run() -> None:
                 b = self._body_json()
