@@ -406,6 +406,48 @@ class StreamingTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("肖申克", "".join(texts[1:]))
         self.assertFalse(orch._speaking)
 
+    async def test_an_agent_task_can_speak_once_the_ack_is_done(self) -> None:
+        """The ack before the intent step set _speaking and the task path never cleared it, so the agent's first
+        sentence ("这个我还不太会…") waited out _agent_say's 30 s loop (44-47 s of silence on 2026-11-07)."""
+        from learning.intent import Intent
+
+        orch = self._llm_turn_shell(13)
+        orch.ack_enabled = True
+        ack = ACK_GROUPS["request"][0]
+        orch._ack_cache = {ack: Path("/cache/ack_ok.wav")}
+        orch.teacher = type("T", (), {"available": True})()
+        orch.teacher_enabled = True
+        orch.skills = object()
+        orch._recent = []
+        orch._agent_running = False
+        orch._pending_creds = None
+        seen: list[bool] = []
+
+        async def run_agent(task, creds=None) -> None:
+            seen.append(orch._speaking)
+
+        orch._run_agent = run_agent  # type: ignore[method-assign]
+        with patch("orchestrator.main.classify_intent", lambda *a, **k: Intent("task", "查一下板子的磁盘")):
+            await orch._run_llm("帮我查一下板子的磁盘", generation=13, vad_end_at=time.monotonic())
+            await orch._agent_task
+        self.assertEqual(orch.tts_queue.enqueued[0][0], f"[clip]{ack}")
+        self.assertEqual(seen, [False])
+
+    async def test_her_version_is_answered_from_the_board(self) -> None:
+        orch = self._llm_turn_shell(14)
+        spoken: list[str] = []
+
+        async def speak(text: str, *, generation: int) -> None:
+            spoken.append(text)
+
+        orch._speak_turn = speak  # type: ignore[method-assign]
+        orch._recent = []
+        orch.journal_dir = None
+        with patch("learning.selfstatus.version_say", lambda *a, **k: "我现在是第五版。"),                 patch("orchestrator.main.llm_chat_stream", lambda *a, **k: self.fail("no LLM for this")):
+            await orch._run_llm("现在的版本是什么", generation=14, vad_end_at=time.monotonic())
+        self.assertEqual(spoken, ["我现在是第五版。"])
+        self.assertEqual(orch._recent[-1]["who"], "selfstatus")
+
     async def test_echo_segment_does_not_cancel_the_reply_being_spoken(self) -> None:
         orch = object.__new__(Orchestrator)
         orch._next_turn_id = 5

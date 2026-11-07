@@ -150,7 +150,46 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.risks, ["danger"])
         self.assertEqual(self.ran, [step])
         self.assertEqual(self.snapshots[0][0], "before-sudo")
-        self.assertTrue(any("备份节点 20261104-120000-before-sudo" in t for t in self.said))
+        self.assertIn("我先存了一个备份节点，万一出问题可以回退。", self.said)
+        self.assertFalse(any("20261104" in t for t in self.said))   # the id is not read out as a string of digits
+
+    async def test_the_snapshot_id_goes_to_the_page(self) -> None:
+        shown = []
+
+        async def progress(p):
+            shown.append(p)
+        step = {"tool": "shell", "cmd": "sudo apt install -y htop", "purpose": "装 htop"}
+        agent = self.agent(ScriptedTeacher([step, {"tool": "done", "success": False, "say": "x"}]))
+        agent.progress = progress
+        await agent.run("帮我在板子上装个软件 htop")
+        self.assertIn("20261104-120000-before-sudo", shown[0]["action"])
+
+    async def test_looking_at_her_own_code_is_sandboxed_not_asked(self) -> None:
+        # 17:48 on 2026-11-07: three read-only looks at /userdata/agent were "danger" - asked, snapshotted, read out
+        boxed = []
+        looks = [r"ls -la /userdata/agent && cat /userdata/agent/VERSION 2>/dev/null; "
+                 r"grep -rn --include=*.py -m3 '__version__\|VERSION *=' /userdata/agent 2>/dev/null | head -20",
+                 "cd /userdata/agent && git describe --tags 2>/dev/null; git log -1 --format='%h %cd %s' --date=short"]
+        teacher = ScriptedTeacher([*({"tool": "shell", "cmd": c, "purpose": "看版本"} for c in looks),
+                                   {"tool": "done", "success": False, "say": "x"}])
+        agent = self.agent(teacher)
+        agent.sandbox = lambda st: (boxed.append(st["cmd"]), (0, "0d8f7e4"))[1]
+        await agent.run("查一下你自己的版本号")
+        self.assertEqual(boxed, looks)
+        self.assertEqual((self.asked, self.snapshots), ([], []))
+
+    async def test_a_plan_sent_as_two_objects_is_understood(self) -> None:
+        class TwoPart(ScriptedTeacher):
+            def complete(self, system, user, **kw):
+                if system == PLAN_SYSTEM and self.steps and self.steps[0].get("tool") != "done":
+                    self.plan_prompts.append(user)
+                    return '{"thought": "先看磁盘"}\n{"step": ' + json.dumps(self.steps.pop(0)) + "}"
+                return super().complete(system, user, **kw)
+        step = {"tool": "shell", "cmd": "df -h", "purpose": "看磁盘"}
+        teacher = TwoPart([step, {"tool": "done", "success": False, "say": "x"}])
+        res = await self.agent(teacher).run("帮我查一下板子的磁盘")
+        self.assertEqual(self.ran, [step])
+        self.assertNotIn("没看懂", res.say)
 
     async def test_danger_step_does_not_run_without_snapshot(self) -> None:
         self.snapshot_fails = True
@@ -322,6 +361,22 @@ class GateTests(unittest.TestCase):
             "grep -m 3 -A 2 error /userdata/agent/logs/orchestrator.log": "safe",
             "tail -n 5 /etc/hosts": "ask", "tail -n /etc/hosts /userdata/agent/logs/x": "ask",
             "head -c 100 /userdata/agent/config/agent.yaml": "ask",
+            # looking at her own code is not dangerous (it goes to the read-only sandbox as "ask")
+            "cd /userdata/agent && ls": "ask", "cd /userdata/agent && git log -1 --oneline": "ask",
+            "git -C /userdata/agent status --short": "ask", "grep -rn 'a\\|b' /userdata/agent | head": "ask",
+            "cd /userdata/agent/run && for f in a.json b.json; do echo \"== $f\"; cat $f; done": "ask",
+            "uname -m && cat /etc/os-release | head -3 && ip -4 addr show | grep inet": "ask",
+            "which tesseract; dpkg -l | grep -i tess; ls /usr/share/tesseract-ocr": "ask",
+            # ...changing it still is
+            "cd /userdata/agent && rm -rf run": "danger", "cd /userdata/agent && echo x > config/a.yaml": "danger",
+            "git -C /userdata/agent checkout .": "danger", "cd /userdata/agent && git -c core.pager=sh log": "danger",
+            "cd /userdata/agent && python3 -c 'import os'": "danger", "ls /etc; command rm /etc/x": "danger",
+            "date -s 2020-01-01 && ls /etc": "danger", "sort -o /etc/x /etc/y": "danger", "uniq /etc/a /etc/b": "danger",
+            "ls /etc &> /etc/x": "danger", "cat /etc/hosts >| /etc/x": "danger", "for f in /etc/*; do mv $f /tmp; done": "danger",
+            "echo `rm /userdata/agent/x`": "danger", "ls $(rm -rf /userdata/agent/x)": "danger",
+            "git -C /userdata/agent diff --output=/etc/x": "danger", "hostname box; ls /etc": "danger",
+            "grep 'a' /etc/x | tee /etc/y": "danger", "cat <<EOF > /etc/x\nhi\nEOF": "danger",
+            "ls /userdata/agent; foo 'oops": "danger",   # unbalanced quote: the old coarse split, still strict
         }
         for cmd, want in cases.items():
             self.assertEqual(classify({"tool": "shell", "cmd": cmd})[0], want, cmd)

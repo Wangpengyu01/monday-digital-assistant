@@ -2211,6 +2211,19 @@ class Orchestrator:
                 self._record_chat_turn(user_prompt, reply)
                 return
 
+            # "你现在什么版本" / "汇报一下你的进度": read off the board (learning/selfstatus.py) - not a question
+            # for the teacher, not a shell task
+            from learning.selfstatus import status_command
+            doing = getattr(self, "_agent_task_text", "") if getattr(self, "_agent_running", False) else ""
+            status = status_command(user_prompt, doing=doing)
+            if status is not None:
+                reply = await asyncio.to_thread(status)
+                LOG.info("[selfstatus] %s -> %s", user_prompt[:60], reply[:80])
+                await self._speak_turn(reply, generation=generation)
+                self._record_chat_turn(user_prompt, reply)
+                self._journal(user_prompt, reply, "selfstatus", "status")
+                return
+
             # 先分类: the teacher reads the recent turns and says what is wanted (task / knowledge / ...)
             teacher = getattr(self, "teacher", None)
             if teacher is not None and getattr(self, "teacher_enabled", False) and getattr(self, "skills", None) is not None:
@@ -2243,6 +2256,11 @@ class Orchestrator:
                     self._pending_creds = None if (creds and creds.host) else creds  # keep it until a host is known
                     use = creds if (creds and creds.host) else None
                     LOG.info("[agent] task: %s%s", intent.rewrite[:80], " (with credentials)" if use else "")
+                    if getattr(self, "_speaking", False):
+                        # the ack ("嗯，我想想哈") set _speaking and nothing on this path cleared it, so the
+                        # agent's first sentence waited out _agent_say's 30 s loop: let the ack finish, then clear
+                        await self.tts_queue.wait_done(generation=generation)
+                        self._speaking = False
                     self._agent_task = asyncio.create_task(self._run_agent(intent.rewrite, use))
                 return
             if intent.kind in ("knowledge", "ask_teacher"):
@@ -2583,6 +2601,7 @@ class Orchestrator:
                       sandbox=sandbox_run_step if getattr(self, "agent_sandbox", False) else None,
                       grants=getattr(self, "grants", None), log_training=lambda q, a: self.learner.log_training(q, a, system=self._system_body()))
         await self.emit({"type": "agent_start", "task": task})
+        self._agent_task_text = task  # "你在忙什么" mentions it (learning/selfstatus.py)
         self._agent_asked = False  # the first question of a task explains "这次都行"
         self._mark_activity()
         self._agent_running = True

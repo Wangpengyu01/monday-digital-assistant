@@ -10,12 +10,11 @@ fails or is slow), fallback() keeps the old keyword rules so the assistant still
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
 
-from learning.agent import is_agent_task
+from learning.agent import is_agent_task, json_object as _json
 
 LOG = logging.getLogger(__name__)
 
@@ -43,15 +42,6 @@ class Intent:
     rewrite: str
     why: str = ""
     by: str = "teacher"  # "teacher" or "rules"
-
-
-def _json(text: str) -> dict:
-    i, j = (text or "").find("{"), (text or "").rfind("}")
-    try:
-        obj = json.loads(text[i:j + 1]) if 0 <= i < j else {}
-    except ValueError:
-        return {}
-    return obj if isinstance(obj, dict) else {}
 
 
 def fallback(text: str) -> Intent:

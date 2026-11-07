@@ -77,26 +77,104 @@ _SYSTEMCTL_CHANGE = {"start", "stop", "restart", "reload", "try-restart", "reloa
 _GIT_CHANGE = {"checkout", "reset", "clean", "pull", "merge", "rebase", "push", "rm", "mv", "commit", "stash", "apply",
                "restore", "switch"}
 _PROTECTED = re.compile(r"""(^|[\s'"=:])(/etc|/boot|/usr|/lib|/bin|/sbin|/var/lib|/userdata/agent|/userdata/backups|"""
-                        r"""~?/\.ssh|/home/[^/\s]+/\.ssh)(/|\s|$|['"])""")
+                        r"""~?/\.ssh|/home/[^/\s]+/\.ssh)(/|\s|$|['";&|)])""")
 _READERS = {"cat", "head", "tail", "grep", "ls", "stat", "du", "df", "wc", "file", "md5sum", "sha256sum", "diff",
-            "less", "find", "readlink", "realpath", "test", "echo", "systemctl", "journalctl"}
+            "less", "find", "readlink", "realpath", "test", "echo", "systemctl", "journalctl",
+            # looking around: none of these can change anything
+            "cd", "pwd", "which", "type", "uname", "lsb_release", "true", "false", "printf", "basename", "dirname",
+            "id", "whoami", "nproc", "free", "uptime", "ps", "lsblk", "tree", "jq", "apt-cache", "dpkg-query", "cut",
+            "tr", "nl", "tac", "column", "sleep", "[", "ip", "ss", "nmcli", "lscpu", "lsusb", "lspci", "arch",
+            "getconf", "locale"}  # ip / nmcli changes are caught before this
 _WRITE_REDIRECT = re.compile(r"(\d*)>>?\s*(&?)\s*([^\s;&|]*)")
 _WRAPPERS = {"env", "nohup", "nice", "timeout", "xargs", "exec", "time", "stdbuf", "ionice", "bash", "sh"}
+_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}"}  # "do cat $f" runs cat
+_NO_COMMAND = {"for", "select", "case", "done", "fi", "esac", "in"}  # "for f in a b" runs nothing itself
+_GIT_READ = {"log", "describe", "status", "show", "diff", "rev-parse", "ls-files", "blame", "shortlog", "rev-list"}
+_GIT_BRANCH_LIST = {"-a", "-v", "-vv", "-r", "--list", "--all", "--show-current", "--no-color"}
+_DPKG_QUERY = {"-l", "-L", "-s", "-S", "-p", "--list", "--listfiles", "--status", "--search", "--print-architecture"}
+
+
+def _tokens(cmd: str) -> list[str] | None:
+    """Shell words and operators, quotes respected (grep 'a\\|b' stays one word); None if unparseable."""
+    text = cmd.replace("\n", " ; ").replace("`", " ; ").replace("$(", " ; ( ")
+    lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # "ls # x; rm y": checking "rm y" too is the safe side
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _commands(cmd: str) -> tuple[list[list[str]], bool]:
+    """-> (the simple commands in `cmd` as word lists, whether a redirect writes a file)."""
+    toks = _tokens(cmd)
+    if toks is None:  # unbalanced quotes: the old coarse split (stricter, never looser)
+        segs = []
+        for seg in re.split(r"\|\|?|&&|;|\$\(|`|\n", cmd):
+            try:
+                segs.append(shlex.split(seg))
+            except ValueError:
+                segs.append(seg.split())
+        writes = any(not m.group(2) and m.group(3) != "/dev/null" for m in _WRITE_REDIRECT.finditer(cmd))
+        return segs, writes
+    segs, cur, writes, i = [], [], False, 0
+    while i < len(toks):
+        t = toks[i]
+        if t and set(t) <= set("|&;()"):
+            segs.append(cur)
+            cur = []
+        elif t and set(t) <= set("<>&|") and ("<" in t or ">" in t):
+            target = toks[i + 1] if i + 1 < len(toks) else ""
+            if ">" in t and target != "/dev/null" and not (t.endswith("&") and re.fullmatch(r"\d+|-", target)):
+                writes = True  # > f, >> f, &> f, >| f, <> f; not 2>/dev/null or 2>&1
+            i += 1  # the target is not a word of the command
+        else:
+            cur.append(t)
+        i += 1
+    segs.append(cur)
+    return segs, writes
+
+
+def _reader(first: str, words: list[str]) -> bool:
+    """`first` (with its arguments `words`) only looks at things."""
+    args = words[1:]
+    if first == "git":
+        while args and args[0] in ("-C", "--no-pager", "-P") or (args and args[0].startswith(("--git-dir=", "--work-tree="))):
+            args = args[2:] if args[0] == "-C" else args[1:]
+        if not args or any(a == "-c" or a.startswith(("--output", "--ext-diff", "--exec", "--upload-pack")) for a in args):
+            return False
+        return args[0] in _GIT_READ or (args[0] == "branch" and set(args[1:]) <= _GIT_BRANCH_LIST)
+    if first == "command":  # "command -v x" looks; "command rm x" runs rm
+        return bool(args) and args[0] in ("-v", "-V")
+    if first == "date":
+        return not any(a in ("-s", "--set") or a.startswith("--set=") for a in args)
+    if first == "hostname":
+        return all(a.startswith("-") and a not in ("-F", "--file", "-b", "--boot") for a in args)
+    if first == "dpkg":
+        return any(a in _DPKG_QUERY for a in args)
+    if first in ("apt", "apt-get"):
+        return bool(args) and args[0] in ("list", "show", "search", "policy")
+    if first == "sort":
+        return not any(a.startswith(("-o", "--output")) for a in args)
+    if first == "uniq":
+        return len([a for a in args if not a.startswith("-")]) <= 1  # "uniq in out" writes out
+    return first in _READERS
 
 
 def _danger(cmd: str) -> str:
     """Why `cmd` can damage the system, or "" (deliberately coarse: when unsure, it is dangerous)."""
-    for m in _WRITE_REDIRECT.finditer(cmd):
-        if not m.group(2) and m.group(3) != "/dev/null":
-            return "会写文件（重定向）"
+    segments, writes = _commands(cmd)
+    if writes:
+        return "会写文件（重定向）"
     if re.search(r"\bsed\b[^|;&]*\s-[a-zA-Z]*i|\bperl\b[^|;&]*\s-[a-zA-Z]*i|\bfind\b[^|;&]*\s-(delete|exec|execdir|ok)\b", cmd):
         return "会改动或删除文件"
     reads_only = True
-    for seg in re.split(r"\|\|?|&&|;|\$\(|`|\n", cmd):
-        try:
-            words = shlex.split(seg)
-        except ValueError:
-            words = seg.split()
+    for words in segments:
+        if words and words[0] in _NO_COMMAND:
+            continue
+        while words and words[0] in _KEYWORDS:
+            words = words[1:]
         while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
             words = words[1:]  # FOO=bar cmd
         while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:  # nohup / timeout 5 / env X=1 ... cmd
@@ -127,7 +205,7 @@ def _danger(cmd: str) -> str:
             return "会下载或上传文件"
         if first == "tar" and any(w == "--extract" or re.match(r"^-?[a-wyzA-Z]*x", w) for w in words[1:2]):
             return "会解包写文件"
-        if first not in _READERS:
+        if not _reader(first, words):
             reads_only = False
     if not reads_only and _PROTECTED.search(cmd):
         return "涉及系统目录或星期一自己的代码"
@@ -274,6 +352,10 @@ PLAN_SYSTEM = (
     "改系统、装软件、重启服务、连别的机器都会先问主人，被拒绝就停。步骤失败就换思路，别重复同一条命令。"
     "查服务在不在跑用 systemctl is-active 服务名；进程名和服务名不一样（r1-orchestrator 是 python3 -m orchestrator.main，"
     "r1-tts-daemon 是 rknn_qwen3_tts），ps 里 grep 服务名搜不到不等于它挂了。"
+    "星期一自己的版本：代码提交号在 /userdata/agent/DEPLOYED_COMMIT，模型的 LoRA 版本看 "
+    "/etc/systemd/system/r1-llm-daemon.service.d/lora.conf 里的模型目录名（比如 monday-v5 就是第五版）。"
+    "任务里的「刚才那个」「它」「那个程序」从任务和已执行步骤里都看不出指什么时，不要挨个去猜，"
+    "第一步就给 done（success 为 false），在 say 里问主人具体是哪个。"
     "只是查看的命令（含管道、awk、python3 小脚本）会在只读沙箱里直接执行，不打扰主人：看得到系统状态和日志，"
     "但写不了文件、不能联网、看不到 /userdata/agent/run；结果开头会标「沙箱里运行」。真要改东西就给出改东西的步骤，主人会被询问。\n"
     '只输出 JSON：{"thought": "简短思考", "step": {...}}'
@@ -359,13 +441,34 @@ def take_snapshot(label: str, reason: str) -> str:
     return snapshot.create(label, reason).id
 
 
-def _json(text: str) -> dict:
-    i, j = (text or "").find("{"), (text or "").rfind("}")
-    try:
-        obj = json.loads(text[i:j + 1]) if 0 <= i < j else {}
-    except ValueError:
+def json_object(text: str) -> dict:
+    """The JSON object in a model reply (text around it ignored). The teacher sometimes sends its parts as
+    separate objects - {"thought": ...} then {"step": ...} - and one big slice of both does not parse:
+    then every object found is read and merged (the first value of a key wins)."""
+    text = text or ""
+    i, j = text.find("{"), text.rfind("}")
+    if not 0 <= i < j:
         return {}
-    return obj if isinstance(obj, dict) else {}
+    try:
+        obj = json.loads(text[i:j + 1])
+        return obj if isinstance(obj, dict) else {}
+    except ValueError:
+        pass
+    merged: dict = {}
+    dec, pos = json.JSONDecoder(), i
+    while (k := text.find("{", pos)) >= 0:
+        try:
+            obj, pos = dec.raw_decode(text, k)
+        except ValueError:
+            pos = k + 1
+            continue
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                merged.setdefault(key, val)
+    return merged
+
+
+_json = json_object
 
 
 def _step_of(plan: dict) -> dict:
@@ -503,7 +606,9 @@ class Agent:
                 LOG.warning("[agent] snapshot before danger step failed: %s", exc)
                 return "blocked", -1, f"执行前没能存好备份节点（{exc}），为了安全这一步不做"
             LOG.info("[agent] snapshot %s before: %s", sid, describe_step(step))
-            await self.say(f"我先存了一个备份节点 {sid}，万一出问题可以回退。")
+            if self.progress:  # the id goes to the page; read aloud it was a string of digits
+                await self.progress({"purpose": "执行前存备份节点", "action": f"备份节点 {sid}", "code": 0, "output": sid})
+            await self.say("我先存了一个备份节点，万一出问题可以回退。")
         if step.get("tool") == "mcp":
             if self.mcp is None:
                 code, out = 127, "没有配置 MCP 服务"
