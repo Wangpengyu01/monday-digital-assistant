@@ -101,6 +101,7 @@ class AssociateTests(unittest.TestCase):
         self.assertIn("琢磨到", associate.context_for("失眠怎么办", self.dir, today=later))
         self.assertEqual(associate.context_for("今天几号", self.dir), "")
         self.assertLessEqual(len(ctx.splitlines()[0]), associate.CONTEXT_CHARS)
+        self.assertTrue(ctx.splitlines()[1].endswith("推一段白噪音。"))                    # the idea is never cut
 
     def test_she_can_say_what_she_came_to(self) -> None:
         self.assertIn("还没琢磨出什么", associate.say_ideas(self.dir))

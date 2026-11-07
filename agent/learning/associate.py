@@ -171,17 +171,21 @@ def context_for(text: str, learning_dir: Path = LEARNING, today: str | None = No
     t = norm(text)
     idea = next((i for i in reversed(d["ideas"])
                  if i.get("offered", "") <= rest and any(norm(w) and norm(w) in t for w in i.get("triggers", []))), None)
-    line = ""
-    if parts:
-        line = "能联想到的：" + "；".join(dict.fromkeys(parts))
-    if idea:
-        line += ("\n" if line else "") + f"你之前琢磨到的：{idea['idea']}"
-        if mark:
-            idea["offered"] = today
-            save(d, learning_dir)
-    if not line:
+    idea_line = f"你之前琢磨到的：{idea['idea']}" if idea else ""
+    room = max(40, CONTEXT_CHARS - len(idea_line))   # the idea is never cut; the links make room, whole ones only
+    links, used = [], len("能联想到的：")
+    for p in dict.fromkeys(parts):
+        if used + len(p) + 1 > room:
+            break
+        links.append(p)
+        used += len(p) + 1
+    lines = (["能联想到的：" + "；".join(links)] if links else []) + ([idea_line] if idea_line else [])
+    if idea and mark:
+        idea["offered"] = today
+        save(d, learning_dir)
+    if not lines:
         return ""
-    return line[:CONTEXT_CHARS] + "\n（真有帮助才用一句话顺带提起，别硬扯，先答主人问的）"
+    return "\n".join(lines) + "\n（真有帮助才用一句话顺带提起，别硬扯，先答主人问的）"
 
 
 # ---------------------------------------------------------------- nightly
