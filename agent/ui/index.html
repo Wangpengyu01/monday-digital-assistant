@@ -349,6 +349,12 @@ body.lite .glass, body.lite header, body.lite .panel, body.lite .toast { backdro
             </div>
             <div class="sec">项目（她自己做，做完或卡住了会说）</div>
             <div class="row" style="gap:8px;margin:4px 0 8px"><input type="search" id="pjGoal" placeholder="给她一个目标，比如：写一个……"><button class="btn sm" id="pjStart">开始</button></div>
+            <div class="sec">陪练（老师扮成你去问她本地的模型，答案攒成训练题）</div>
+            <div class="row" style="gap:8px;margin:4px 0 6px;align-items:center">
+              <button class="btn" id="spStart">开始问</button><button class="btn" id="spStop" disabled>停止问</button>
+              <span id="spState" style="color:var(--dim,#888);font-size:13px"></span>
+            </div>
+            <div id="spLast" style="display:none;font-size:13px;line-height:1.6;margin:0 0 10px"></div>
             <div id="pjDrive" style="display:none;margin:4px 0 8px;line-height:1.6"></div>
             <div id="pjProposal" style="display:none;border:1px solid var(--line,#ccc);border-radius:8px;padding:8px;margin:6px 0">
               <div id="pjPropTitle" style="font-weight:600"></div>
@@ -854,7 +860,42 @@ async function answerProposal(yes, btn) {
 }
 $("pjApprove").onclick = (e) => answerProposal(true, e.currentTarget);
 $("pjReject").onclick = (e) => answerProposal(false, e.currentTarget);
+// 陪练 (learning/spar.py): start / stop, and how it is going right now
+async function loadSpar() {
+  try {
+    const d = await api("/api/spar"), L = d.live || {};
+    $("spStart").disabled = d.running;
+    $("spStop").disabled = !d.running || d.stopping;
+    const pct = (ok, n) => n ? Math.round(100 * ok / n) + "%" : "–";
+    if (d.running) {
+      $("spState").textContent = (d.stopping ? "正在停… " : "正在问：") + `已问 ${L.turns || 0} 句，答好 ${L.ok || 0} 句（${pct(L.ok, L.turns)}），攒下 ${L.kept || 0} 条训练题`;
+    } else if (L.started) {
+      $("spState").textContent = `上次 ${String(L.started).slice(5, 16)}：问了 ${L.turns || 0} 句，答好 ${pct(L.ok, L.turns)}` + (d.why ? `；停下是因为${d.why}` : "");
+    } else {
+      $("spState").textContent = "还没问过";
+    }
+    const last = L.last, box = $("spLast");
+    box.style.display = last ? "" : "none";
+    if (last) {
+      box.textContent = "";
+      box.append(el("div", null, "你（老师扮的）：" + last.q), el("div", null, "她：" + last.a),
+        el("div", null, last.ok ? "✓ 答得好" : `✗ ${last.kind}，应该答：${last.better || "（没给出能用的改法）"}`));
+    }
+  } catch (err) { /* the page works without it */ }
+}
+async function sparDo(what, btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/spar/" + what, { method: "POST" });
+    const d = await r.json().catch(() => ({}));
+    toast(d.say || d.error || "没成功");
+  } catch (err) { toast(err.message); }
+  setTimeout(loadSpar, 1500);
+}
+$("spStart").onclick = (e) => sparDo("start", e.currentTarget);
+$("spStop").onclick = (e) => sparDo("stop", e.currentTarget);
 async function loadProjects() {
+  loadSpar();
   try {
     const d = await api("/api/projects");
     const say = { new: ["排队", "no"], running: ["在做", "no"], done: ["做完", "ok"], gave_up: ["没做成", "no"], over_budget: ["钱用完", "no"],

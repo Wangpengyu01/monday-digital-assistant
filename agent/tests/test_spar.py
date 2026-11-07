@@ -122,6 +122,27 @@ class SparTests(unittest.TestCase):
                          cost=lambda: (0.0, 0.0), max_turns=2, rng=random.Random(3))
         self.assertEqual((res["sessions"], res["why"]), (2, "turns"))
 
+    def test_stop_button_and_live_progress(self) -> None:
+        t = Teacher([{"say": "你好", "end": False}, {"say": "你是谁", "end": False}, {"say": "再见", "end": True}],
+                    [{"ok": True}, {"ok": False, "kind": "不认识自己", "problem": "x", "better": "我是星期一。"}, {"ok": True}])
+        seen = []
+        pressed = {"stop": False}
+
+        def her(m):
+            if len(seen) == 2:
+                pressed["stop"] = True                     # 停止问 pressed while she answers the second
+            seen.append(spar.read_live(self.dir))
+            return "嗯。"
+        res = spar.night(t, her, persona=PERSONA, facts="", learning_dir=self.dir, cost=lambda: (0.0, 0.0),
+                         stop=lambda: pressed["stop"], manual=True, rng=random.Random(4))
+        self.assertEqual(res["why"], "stopped")
+        self.assertEqual([s["turns"] for s in seen], [0, 1, 2])                       # updated after every turn
+        self.assertTrue(seen[0]["running"] and seen[0]["manual"])
+        live = spar.read_live(self.dir)
+        self.assertEqual((live["running"], live["why"], live["turns"], live["ok"]), (False, "stopped", 3, 2))
+        self.assertEqual(live["last"]["q"], "再见")
+        self.assertIn(live["why"], spar.WHY_SAY)
+
     def test_peak_and_month_cap(self) -> None:
         t = Teacher([], [])
         self.assertEqual(spar.night(t, self.her([]), persona=PERSONA, facts="", learning_dir=self.dir,

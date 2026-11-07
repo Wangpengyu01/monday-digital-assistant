@@ -418,6 +418,59 @@ def start_study(what: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+SPAR_UNITS = ("r1-spar-now.service", "r1-spar.service")   # pressed on the page / the 03:00 timer
+
+
+def spar_info() -> dict[str, Any]:
+    """陪练 (learning/spar.py): is it running, how it is going right now, the last finished run."""
+    _project_mod()
+    from learning import spar
+    running = any(_systemctl("is-active", u) in ("active", "activating", "deactivating") for u in SPAR_UNITS)
+    stopping = any(_systemctl("is-active", u) == "deactivating" for u in SPAR_UNITS)
+    live = spar.read_live()
+    last = spar.latest()
+    out: dict[str, Any] = {"running": running, "stopping": stopping, "live": live,
+                           "why": spar.WHY_SAY.get(live.get("why", ""), live.get("why", ""))}
+    if last:
+        out["latest"] = {"day": last[0], **{k: last[1][k] for k in ("turns", "ok", "kept", "kinds")}}
+    return out
+
+
+def start_spar() -> dict[str, Any]:
+    """The owner pressed 开始问: the teacher plays him and asks her local model, now, for up to an hour.
+    Fixed command line only; the same lock as the nightly run, so never two at once."""
+    from learning import usage as _usage
+    if _usage.is_peak():   # the owner's rule: no teacher calls in DeepSeek's peak hours
+        return {"ok": False, "error": "现在是老师的高峰时段，12 点 / 18 点以后再问"}
+    if spar_info()["running"]:
+        return {"ok": False, "error": "已经在问了"}
+    cmd = ["sudo", "-n", "systemd-run", "--no-block", "--quiet", "--collect", "--unit=r1-spar-now",
+           "--uid=youyeetoo", "--gid=youyeetoo", "-p", "EnvironmentFile=-/userdata/secrets/deepseek.env",
+           "-p", f"WorkingDirectory={AGENT_ROOT}", "-p", f"Environment=PYTHONPATH={AGENT_ROOT}",
+           "-p", "Environment=MONDAY_USAGE_TAG=陪练", "-p", "Nice=10", "-p", "TimeoutStopSec=120",
+           "-p", f"StandardOutput=append:{AGENT_ROOT}/logs/spar.log", "-p", f"StandardError=append:{AGENT_ROOT}/logs/spar.log",
+           "/usr/bin/flock", "-n", "-E", "0", "/tmp/monday-spar.lock",
+           "/usr/bin/python3", "-m", "learning.spar", "--manual", "--minutes", "60", "--max-yuan", "3", "--max-turns", "300"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc)}
+    if r.returncode != 0:
+        return {"ok": False, "error": (r.stderr or "启动失败").strip()[-200:]}
+    LOG.info("[spar] started from the page")
+    return {"ok": True, "say": "开始了：老师扮成你去问她，最多一小时；你一跟她说话就会停"}
+
+
+def stop_spar() -> dict[str, Any]:
+    """The owner pressed 停止问: SIGTERM - she finishes the turn in hand, records the run and exits."""
+    try:
+        subprocess.run(["sudo", "-n", "systemctl", "stop", "--no-block", *SPAR_UNITS], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc)}
+    LOG.info("[spar] stopped from the page")
+    return {"ok": True, "say": "正在停：这一句问完就停"}
+
+
 def study_now() -> dict[str, Any]:
     """What she is studying this minute (learning/now.py), whether a lesson is queued behind practice,
     and when the next lesson / practice round starts."""
@@ -587,6 +640,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             "/api/roots": lambda: self._json(roots_info()),
             "/api/school": lambda: self._json(school_info()),
             "/api/projects": lambda: self._json(projects_info()),
+            "/api/spar": lambda: self._json(spar_info()),
             "/api/progress": lambda: self._json(progress_info()),
             "/api/owner": lambda: self._json(owner_info()),
             "/api/files": lambda: self._json(list_dir(qs.get("root", "files"), qs.get("path", ""))),
@@ -618,6 +672,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 res = start_project(str(self._body_json().get("goal") or ""))
                 self._json(res, 200 if res.get("ok") else 409)
             self._guard(run_project)
+        elif u.path in ("/api/spar/start", "/api/spar/stop"):
+            def run_spar() -> None:
+                res = start_spar() if u.path.endswith("start") else stop_spar()
+                self._json(res, 200 if res.get("ok") else 409)
+            self._guard(run_spar)
         elif u.path == "/api/project/answer":
             def run_answer() -> None:
                 b = self._body_json()

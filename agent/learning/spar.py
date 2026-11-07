@@ -182,7 +182,8 @@ def usable(text: str, q: str = "") -> bool:
 
 # ---------------------------------------------------------------- a session and a night
 def session(teacher, ask: Callable[[list[dict]], str], *, persona: str, system: str, facts: str, seeds: list[str],
-            focus: str, learning_dir: Path = LEARNING, idle: Callable[[], bool] = lambda: True) -> dict:
+            focus: str, learning_dir: Path = LEARNING, idle: Callable[[], bool] = lambda: True,
+            on_turn: Callable[[dict], None] | None = None) -> dict:
     """One conversation -> {"turns": [...], "stopped": bool}; samples and pairs are written as it goes."""
     out_dir = learning_dir / "spar"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +210,8 @@ def session(teacher, ask: Callable[[list[dict]], str], *, persona: str, system: 
             _append(out_dir / "pairs.jsonl", {"messages": m, "chosen": j["better"], "rejected": a, "kind": j["kind"]})
             turn["kept"] = "corrected"
         rec["turns"].append(turn)
+        if on_turn:
+            on_turn(turn)
         transcript.append((o["say"], a))   # he goes on from what she actually said
         if o["end"]:
             break
@@ -269,15 +272,31 @@ def spent(day: str | None = None, month: bool = False) -> float:
 def night(teacher, ask: Callable[[list[dict]], str], *, persona: str, facts: str, learning_dir: Path = LEARNING,
           minutes: float = 120, max_yuan: float = NIGHT_YUAN, month_yuan: float = MONTH_YUAN, max_turns: int = NIGHT_TURNS,
           idle: Callable[[], bool] = lambda: True, blocked: Callable[[], bool] = lambda: False,
+          stop: Callable[[], bool] = lambda: False, manual: bool = False,
           cost: Callable[[], tuple[float, float]] | None = None, rng: random.Random | None = None) -> dict:
-    """Sessions until the time, the night's budget or the month's runs out, the peak starts or the owner talks."""
+    """Sessions until the time, the night's budget or the month's runs out, the peak starts, the owner talks
+    or he presses 停止问 (stop). The page follows it in spar/live.json."""
     rng = rng or random.Random()
     cost = cost or (lambda: (spent(), spent(month=True)))
     seeds, topics = owner_seeds(learning_dir, rng=rng), focuses(learning_dir)
     end = time.time() + minutes * 60
     done: list[dict] = []
     why = "time"
+    live = {"running": True, "manual": manual, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "turns": 0, "ok": 0,
+            "kept": 0, "last": None, "why": ""}
+    write_live(learning_dir, live)
+
+    def on_turn(t: dict) -> None:
+        live["turns"] += 1
+        live["ok"] += 1 if t["ok"] else 0
+        live["kept"] += 1 if t["kept"] else 0
+        live["last"] = {k: t[k] for k in ("q", "a", "ok", "kind", "better")}
+        write_live(learning_dir, live)
+
     while time.time() < end:
+        if stop():
+            why = "stopped"
+            break
         tonight, this_month = cost()
         if tonight >= max_yuan:
             why = "budget"
@@ -299,17 +318,38 @@ def night(teacher, ask: Callable[[list[dict]], str], *, persona: str, facts: str
         try:
             s = session(teacher, ask, persona=persona, system=her_system(persona, learning_dir), facts=facts,
                         seeds=rng.sample(seeds, min(len(seeds), 20)) if seeds else [], focus=focus,
-                        learning_dir=learning_dir, idle=idle)
+                        learning_dir=learning_dir, idle=lambda: idle() and not stop(), on_turn=on_turn)
         except Exception as exc:  # noqa: BLE001 - a teacher hiccup or a busy model: wait a little, go on
             LOG.warning("session failed: %s", exc)
             time.sleep(20)
             continue
         done.append(s)
         if s["stopped"]:
-            why = "owner"
+            why = "stopped" if stop() else "owner"
             break
     n = record_night(learning_dir, dt.date.today().isoformat(), done, cost()[0])
+    live.update(running=False, why=why, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
+    write_live(learning_dir, live)
     return {"sessions": len(done), "why": why, "night": n}
+
+
+WHY_SAY = {"time": "到点了", "budget": "今晚的钱花到上限了", "month": "这个月的钱花到上限了", "peak": "老师的高峰时段到了",
+           "turns": "今晚的句数够了", "owner": "你开口说话了，本地模型先让给你", "stopped": "你按了停止"}
+
+
+def write_live(learning_dir: Path, live: dict) -> None:
+    p = learning_dir / "spar" / "live.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".live.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(live, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def read_live(learning_dir: Path = LEARNING) -> dict:
+    try:
+        return json.loads((learning_dir / "spar" / "live.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def say(learning_dir: Path = LEARNING) -> str:
@@ -333,7 +373,13 @@ def main() -> None:
     ap.add_argument("--max-yuan", type=float, default=NIGHT_YUAN)
     ap.add_argument("--max-turns", type=int, default=NIGHT_TURNS)
     ap.add_argument("--any-time", action="store_true", help="also in the teacher's peak hours")
+    ap.add_argument("--manual", action="store_true",
+                    help="the owner pressed 开始问: only his talking *after* the start stops it")
     a = ap.parse_args()
+    import signal
+    import threading
+    stopping = threading.Event()   # 停止问 (systemctl stop): finish the turn in hand, record, exit
+    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     os.environ.setdefault("MONDAY_USAGE_TAG", TAG)
     from learning import exam, usage
@@ -343,9 +389,16 @@ def main() -> None:
 
     rt = build_runtime(a.config)
     run_dir = AGENT_ROOT / "run"
+    started = time.time()
+    if a.manual:
+        def idle() -> bool:
+            return last_activity(run_dir) <= started
+    else:
+        def idle() -> bool:
+            return time.time() - last_activity(run_dir) > IDLE_MIN * 60
     res = night(rt.teacher, board_student(), persona=exam.persona(a.config), facts=version_say(),
                 learning_dir=rt.learning_dir, minutes=a.minutes, max_yuan=a.max_yuan, max_turns=a.max_turns,
-                idle=lambda: time.time() - last_activity(run_dir) > IDLE_MIN * 60,
+                idle=idle, stop=stopping.is_set, manual=a.manual,
                 blocked=(lambda: False) if a.any_time else usage.peak_blocked)
     print(json.dumps(res, ensure_ascii=False, indent=1))
 
