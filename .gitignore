@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+agent/run/
+agent/logs/
+agent/ui/latest_frame.jpg

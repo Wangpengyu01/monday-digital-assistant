@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(AGENT_ROOT))
+
+from asr.normalize import normalize_user_text  # noqa: E402
+
+
+class NormalizeUserTextTests(unittest.TestCase):
+    def test_keeps_topic_before_how_question(self) -> None:
+        self.assertEqual(normalize_user_text("火星是怎么形成的"), "火星是怎么形成的")
+
+    def test_handles_wake_word_prefixes(self) -> None:
+        self.assertEqual(normalize_user_text("嘿小揽"), "星期一")
+        self.assertEqual(normalize_user_text("嗨小揽"), "星期一")
+        self.assertEqual(normalize_user_text("喂小揽"), "星期一")
+        self.assertEqual(normalize_user_text("你好小揽"), "你好")
+        self.assertEqual(normalize_user_text("嘿星期一"), "星期一")
+        self.assertEqual(normalize_user_text("星期一"), "星期一")
+        self.assertEqual(normalize_user_text("你好星期一"), "你好")
+        self.assertEqual(normalize_user_text("嘿星期一几点了"), "几点了")
+        self.assertEqual(normalize_user_text("可以星期一几点"), "几点")
+        # a bare leading 星期一 is the weekday, not a call by name
+        self.assertEqual(normalize_user_text("星期一几点开会"), "星期一几点开会")
+        self.assertEqual(normalize_user_text("嘿小揽今天星期几"), "今天星期几")
+        self.assertEqual(normalize_user_text("小揽，桌上有什么"), "桌上有什么")
+        self.assertEqual(normalize_user_text("喂小揽帮我看看"), "帮我看看")  # two-character reduplication is normal Chinese
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class KeepDigitsAndLetters(unittest.TestCase):
+    def test_repeats_in_numbers_and_letters_survive(self) -> None:
+        self.assertEqual(normalize_user_text("IP是10.0.0.155"), "IP是10.0.0.155")
+        self.assertEqual(normalize_user_text("SSH到196"), "SSH到196")
+        self.assertEqual(normalize_user_text("密码aa1122"), "密码aa1122")
+        self.assertEqual(normalize_user_text("幺五五"), "幺五五")
+        self.assertEqual(normalize_user_text("帮我看看看"), "帮我看")
+        self.assertEqual(normalize_user_text("我的猫叫豆豆"), "我的猫叫豆豆")
