@@ -110,3 +110,58 @@ def is_vision_query(text: str) -> bool:
         return False
     return bool(_VISION_INTENT.search(clean))
 
+
+
+_UNHEARD_MARK = ("没听明白", "没听清", "换个说法", "再说一遍")
+
+
+def _topic_from_recent(recent: list[dict] | None) -> str:
+    """Pick a short topic phrase from the last readable assistant/user turn."""
+    if not recent:
+        return ""
+    for turn in reversed(recent):
+        answer = str(turn.get("a") or "")
+        question = str(turn.get("q") or "")
+        for src in (answer, question):
+            if not src:
+                continue
+            if any(mark in src for mark in _UNHEARD_MARK):
+                continue
+            text = re.sub(r"[^\u4e00-\u9fa50-9a-zA-Z]", "", src)
+            if len(text) >= 2:
+                return text[:8]
+    return ""
+
+
+def _already_said(reply: str, previous_reply: str) -> bool:
+    return bool(previous_reply) and reply.strip() == previous_reply.strip()
+
+
+def unclear_reply(recent: list[dict] | None, attempts: int = 1, previous_reply: str = "") -> str:
+    """Progressive fallback when speech can't be understood.
+
+    attempts=1: guess the most likely meaning from the recent topic.
+    attempts=2: offer two concrete options (A/B) to pick from.
+    attempts>=3: admit not hearing it and ask to rephrase, varying wording.
+    """
+    topic = _topic_from_recent(recent)
+    if attempts <= 1:
+        if topic:
+            reply = f"您是在说刚才{topic}那件事吗？"
+        else:
+            reply = "您是在问刚才我们聊的那件事吗？"
+        if _already_said(reply, previous_reply):
+            reply = f"我想确认一下，您说的是跟{topic or '刚才的事'}有关吗？"
+        return reply
+    if attempts == 2:
+        if topic:
+            reply = f"我没太听清。您是想问{topic}这件事，还是另一件事？A：{topic}；B：别的事，您再说一下。"
+        else:
+            reply = "我没太听清。A：接着说刚才的事；B：换个新话题。您选哪个？"
+        if _already_said(reply, previous_reply):
+            reply = "还是没听清。A：继续刚才的话题；B：说点别的。您回我一个就行。"
+        return reply
+    base = "这句我确实没听清，您换个说法，或者直接说关键词也行。"
+    if _already_said(base, previous_reply):
+        base = "抱歉，还是没抓到您的意思，说两个关键词我就能跟上。"
+    return base

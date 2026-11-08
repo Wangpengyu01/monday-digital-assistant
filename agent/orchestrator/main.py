@@ -1305,6 +1305,7 @@ class Orchestrator:
             self._push_recent(question, answer, who)
 
     def _record_chat_turn(self, user: str, assistant: str) -> None:
+        self._unclear_attempts = 0  # a normal turn means we understood again
         if self.history_max_turns <= 0:
             self._chat_turns.clear()
             return
@@ -1312,8 +1313,10 @@ class Orchestrator:
         if not text:
             return
         if self._chat_turns and self._chat_turns[-1][1].strip() == text:
-            LOG.warning("[llm] repetition detected in record_turn, wiping history")
-            self._chat_turns.clear()
+            # same wording twice in a row: drop only the stale last turn, keep the rest so the
+            # next reply still has context (clearing everything made the following turn clueless)
+            LOG.warning("[llm] repetition detected in record_turn, dropping last turn (history kept)")
+            self._chat_turns = self._chat_turns[:-1]
             return
         self._chat_turns.append((user, text))
         if len(self._chat_turns) > self.history_max_turns:
@@ -2317,7 +2320,15 @@ class Orchestrator:
                 from learning.intent import Intent
                 intent = Intent("chat", intent.rewrite or user_prompt, "readable", intent.by)
             if intent.kind == "unclear":
-                reply = "这句我没听明白，能换个说法再说一遍吗？"
+                from orchestrator.dialogue_policy import unclear_reply
+                self._unclear_attempts = getattr(self, "_unclear_attempts", 0) + 1
+                prev = ""
+                rec = getattr(self, "_recent", None) or []
+                for t in reversed(rec):
+                    if t.get("who") != "主人" and t.get("a"):
+                        prev = t.get("a", "")
+                        break
+                reply = unclear_reply(list(rec), self._unclear_attempts, prev)
                 await self._speak_turn(reply, generation=generation)
                 self._journal(user_prompt, reply, "intent", "unclear")
                 return
