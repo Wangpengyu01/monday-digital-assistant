@@ -35,7 +35,8 @@ TIMEOUT_S = 20.0
 MEMORY_BYTES = 2 * 1024 ** 3        # address space per process
 HIDDEN = ("/userdata/secrets", "/home", "/root", "/userdata/agent/run", "/run/user")
 DBUS_DIR = "/run/dbus"
-NOTE = "（沙箱里运行：文件系统只读、不能联网）"
+OUTBOX = "/userdata/files/out"   # the one place a sandboxed step may write (plots, exports); shown in the page's 文件 tab
+NOTE = f"（沙箱里运行：文件系统只读、不能联网；只有 {OUTBOX} 能写，要留下的文件放那里）"
 _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # talk to the network: never sandboxed (they would just fail there); the owner is asked as before
@@ -113,6 +114,8 @@ def argv(cmd: str, *, net: bool = False, dbus: bool = False) -> list[str]:
     for p in HIDDEN + (() if dbus else (DBUS_DIR,)):
         if os.path.isdir(p):
             a += ["--tmpfs", p]
+    if os.path.isdir(OUTBOX):   # a plot written to a tmpfs was "made" and then gone: one real, writable place
+        a += ["--bind", OUTBOX, OUTBOX]
     a += ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]
     if not net:
         a.append("--unshare-net")

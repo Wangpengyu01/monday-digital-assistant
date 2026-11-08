@@ -38,6 +38,16 @@ class SandboxRuleTests(unittest.TestCase):
                     "systemctl status x | python3 -c y", "systemctl status x | xargs systemctl stop"):
             self.assertFalse(sandbox.needs_dbus(cmd), cmd)
 
+    def test_the_outbox_is_the_one_writable_place(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(sandbox, "OUTBOX", out):
+            a = sandbox.argv("python3 plot.py")
+            i = a.index("--bind")
+            self.assertEqual(a[i + 1:i + 3], [out, out])
+        with mock.patch.object(sandbox, "OUTBOX", "/no/such/outbox"):
+            self.assertNotIn("--bind", sandbox.argv("ls"))      # not there: nothing writable, as before
+
     def test_argv_hides_private_dirs_and_the_bus(self) -> None:
         a = " ".join(sandbox.argv("ls", net=False, dbus=False))
         self.assertIn("--unshare-net", a)

@@ -16,6 +16,27 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+def _task_with_recent(task, recent):
+    """Append recent turns to an agent task so 「上一个……」 can be resolved."""
+    lines = []
+    for t in (recent or [])[-6:]:
+        q = str(t.get("q") or "").strip()
+        a = str(t.get("a") or "").strip()
+        who = str(t.get("who") or "")
+        if not q:
+            continue
+        if who in ("agent", "assistant"):
+            a = q
+            q = ""
+        if q:
+            lines.append("主人：" + q[:200])
+        if a:
+            lines.append("星期一：" + a[:200])
+    if not lines:
+        return task
+    return task + "\n\n最近对话：\n" + "\n".join(lines)
+
+
 _AGENT_ROOT = Path(__file__).resolve().parent.parent
 if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
@@ -2350,7 +2371,8 @@ class Orchestrator:
                         # agent's first sentence waited out _agent_say's 30 s loop: let the ack finish, then clear
                         await self.tts_queue.wait_done(generation=generation)
                         self._speaking = False
-                    self._agent_task = asyncio.create_task(self._run_agent(intent.rewrite, use))
+                    self._agent_task = asyncio.create_task(self._run_agent(
+                        _task_with_recent(intent.rewrite, getattr(self, "_recent", []) or []), use))
                 return
             if intent.kind in ("knowledge", "ask_teacher"):
                 forced_teacher = intent
