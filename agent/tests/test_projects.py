@@ -276,6 +276,9 @@ class RepairTests(unittest.TestCase):
         cmd = lambda text: project.project_command(text, root=self.root, start=lambda slug: started.append(slug) or "",
                                                    active=lambda s: False, is_peak=lambda: False)
         self.assertIsNone(cmd("可以"))                           # a bare "可以" answers agent steps, not proposals
+        self.assertIsNone(cmd("同意"))
+        for said in ("批准上", "批准上线", "批准", "同意上线", "上线吧", "批准修改啊"):   # "批准上线" heard as "批准上"
+            self.assertTrue(project._APPROVE.match(said), said)
         self.assertIn("等你批准", cmd("项目做得怎么样")())
         self.assertIn("这就上线", cmd("批准修改。")())
         self.assertEqual((started, project.load_state(self.pdir)["status"]), ([self.slug], "applying"))

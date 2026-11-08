@@ -41,6 +41,7 @@ MAX_IDEAS = 60
 IDEA_REST_DAYS = 3
 CONTEXT_CHARS = 110      # the local model's context is small (768 tokens)
 RELS = ("因果", "相似", "组成", "同一场景", "先后", "对立", "用途", "属于主人")
+FLUFF = re.compile(r"奖励|积分|打卡|勋章|排行榜|游戏化|成就系统|买一?[台个块]|新买|入手")
 
 GRAPH_SYSTEM = (
     "从语音助手「星期一」和主人的对话里，找出主人生活和工作里的「东西」以及它们之间的关系，用来帮她以后举一反三。"
@@ -61,6 +62,8 @@ JUDGE_SYSTEM = (
     "最后落到一个对主人具体有用的想法；用说话的句子，不用箭头、列表和符号，一共不超过一百五十字。"
     "再从好的那串里提炼一个想法卡片，写清什么时候值得跟主人提（triggers：主人说到哪些词时，两到六个字一个）。"
     "关于主人的事实和他世界里的东西会给你，联想尽量和它们挂上钩。\n"
+    "想法要实在：主人这一周用手头已有的东西就能做的一件具体小事，或者星期一能直接替他做的事（查、写个小脚本、提醒他注意什么）。"
+    "奖励、积分、打卡、游戏化、排行榜这类花哨点子，要买新设备、要做大项目的，都算没用，useful 为 false。\n"
     '只输出 JSON：{"score": 1到5, "comment": "她这串怎么样", "better": "更好的一串（口语）", '
     '"idea": "一句话的想法（对主人说的口吻）", "triggers": ["..."], "useful": true或false}'
 )
@@ -252,6 +255,8 @@ def wander(teacher, ask_local: Callable[[str, str], str], seed: str, *, persona:
            "comment": str(j.get("comment") or "")[:200], "better": str(j.get("better") or "").strip()[:400],
            "idea": str(j.get("idea") or "").strip()[:120], "useful": bool(j.get("useful")), "kept": False}
     triggers = [norm(w) for w in j.get("triggers") or [] if 2 <= len(norm(w)) <= 6][:6]
+    if rec["useful"] and FLUFF.search(rec["idea"]):   # 2026-11-08: "自动奖励小系统""积分鼓励你调试" - not useful to him
+        rec["useful"], rec["comment"] = False, ("（花哨，不实在）" + rec["comment"])[:200]
     if rec["useful"] and rec["idea"] and triggers:
         if not any(norm(i["idea"])[:20] == norm(rec["idea"])[:20] for i in d["ideas"]):
             d["ideas"].append({"idea": rec["idea"], "triggers": triggers, "seed": seed[:60], "date": dt.date.today().isoformat(),

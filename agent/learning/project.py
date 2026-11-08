@@ -634,7 +634,10 @@ def current(root: Path | None = None, active: Callable[[str], bool] = unit_activ
 _START = re.compile(r"(?:做|开|立|搞|建|起)(?:一)?个(?:新)?项目[：:，,。\s]*(?P<goal>.+)")
 _STATUS = re.compile(r"项目.{0,4}(?:怎么样|进度|到哪|做完了吗|状态|做得如何)")
 # answers to a pending proposal - exact short phrases only ("可以" / "同意" alone answer agent steps)
-_APPROVE = re.compile(r"^(?:我)?(?:批准|同意)(?:这个|这次|你的)?(?:修改|改动)(?:了|吧)?$|^批准$|^(?:可以)?上线吧?$")
+# "批准上线" often arrives as "批准上" (2026-11-08 19:45 - she answered "没听明白"); a bare 同意 / 可以 still answers
+# an agent step, not a proposal
+_APPROVE = re.compile(r"^(?:我)?批准(?:这个|这次|你的)?(?:修改|改动|上线|上)?(?:了|吧|啊)?$"
+                      r"|^(?:我)?同意(?:这个|这次|你的)?(?:修改|改动|上线)(?:了|吧|啊)?$|^(?:可以|那就)?上线(?:吧|啊)?$")
 _REJECT = re.compile(r"^(?:不用改|别改了|不批准|不同意修改|拒绝修改|算了不改|先别改|不要改)(?:了|吧)?$")
 # "检查一下你自己" / "自己修修自己": look through her own conversations and fix what went wrong (selfreview)
 # (anchored: "检查一下你自己的服务状态" is a task for the agent, not a self-review)

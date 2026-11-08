@@ -122,6 +122,12 @@ class AssociateTests(unittest.TestCase):
         settings.write_text(json.dumps({"user_title": "小王"}, ensure_ascii=False), encoding="utf-8")
         self.assertEqual(associate.owner_names(self.dir), {"小王"})
 
+    def test_fanciful_ideas_are_not_kept(self) -> None:
+        t = Teacher(GRAPH, [verdict(idea="咱们做个自动奖励小系统，你调试一次就给你加积分。", triggers=["调试"])])
+        res = self.night(t, n_seeds=1)
+        self.assertEqual((res["wandered"], res["ideas"]), (1, 0))
+        self.assertIn("实在", associate.JUDGE_SYSTEM)
+
     def test_the_owner_stops_it(self) -> None:
         res = self.night(Teacher(GRAPH, [verdict()] * 6), n_seeds=3, idle=lambda: False)
         self.assertEqual((res["wandered"], res.get("stopped")), (0, True))
