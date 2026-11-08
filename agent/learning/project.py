@@ -506,10 +506,12 @@ def repair_notice(st: dict, retro: dict, learning_dir: Path = LEARNING) -> str:
     return f"主人，「{title}」我这次没修好：{str(st.get('summary', ''))[:80]}。我不服气，下次换个办法再来。"
 
 
-def notify(text: str, notices: Path = NOTICES) -> None:
-    """Queue a sentence for the orchestrator to say when it's idle (orchestrator _notice_loop)."""
+def notify(text: str, notices: Path = NOTICES, *, ask: bool = False) -> None:
+    """Queue a sentence for the orchestrator to say when it's idle (orchestrator _notice_loop). Several queued
+    notices are said as one brief; ask=True marks one that needs the owner to answer, said in full after it."""
     notices.mkdir(parents=True, exist_ok=True)
-    (notices / f"{time.strftime('%Y%m%d-%H%M%S')}-project.txt").write_text(text.strip(), encoding="utf-8")
+    kind = "ask" if ask else "project"
+    (notices / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}.txt").write_text(text.strip(), encoding="utf-8")
 
 
 def review_lines(learning_dir: Path = LEARNING, n: int = 3) -> str:
@@ -753,7 +755,7 @@ def main() -> None:
         retro = retrospective(pdir, st, ctx)
         if st["status"] == "proposed":
             notify(f"主人，我想改一下我自己：{st['goal'][:24]}。{st.get('summary', '')[:120]}"
-                   "这次要动受保护的文件，改动在网页的项目里能看。你说「批准修改」我就上线，说「不用改」就算了。")
+                   "这次要动受保护的文件，改动在网页的项目里能看。你说「批准修改」我就上线，说「不用改」就算了。", ask=True)
         elif st.get("kind") == "repair":
             notify(repair_notice(st, retro))
         else:

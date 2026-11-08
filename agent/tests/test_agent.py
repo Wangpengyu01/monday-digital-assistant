@@ -143,15 +143,15 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ran, [])
         self.assertEqual(len(teacher.steps), 1)  # it did not go on planning
 
-    async def test_danger_step_snapshots_first_and_says_so(self) -> None:
+    async def test_danger_step_snapshots_first_without_a_second_sentence(self) -> None:
         step = {"tool": "shell", "cmd": "sudo apt install -y htop", "purpose": "装 htop"}
         teacher = ScriptedTeacher([step, {"tool": "done", "success": False, "say": "好了"}])
         await self.agent(teacher).run("帮我在板子上装个软件 htop")
         self.assertEqual(self.risks, ["danger"])
         self.assertEqual(self.ran, [step])
         self.assertEqual(self.snapshots[0][0], "before-sudo")
-        self.assertIn("我先存了一个备份节点，万一出问题可以回退。", self.said)
-        self.assertFalse(any("20261104" in t for t in self.said))   # the id is not read out as a string of digits
+        # the approval question already said "我先存好备份再做": nothing more is spoken about it
+        self.assertFalse(any("备份" in t for t in self.said))
 
     async def test_the_snapshot_id_goes_to_the_page(self) -> None:
         shown = []

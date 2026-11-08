@@ -167,7 +167,9 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(out["missing"], ["不会装 pip"])
         self.assertIn("不会装 pip", project.review_lines(learning))
         project.notify("主人，项目没做成。", self.root / "notices")
-        self.assertEqual(len(list((self.root / "notices").glob("*.txt"))), 1)
+        project.notify("主人，要你批准。", self.root / "notices", ask=True)
+        names = sorted(p.name for p in (self.root / "notices").glob("*.txt"))
+        self.assertEqual([n.rsplit("-", 1)[-1] for n in names], ["project.txt", "ask.txt"] if names[0].endswith("project.txt") else ["ask.txt", "project.txt"])
 
 
 class VoiceCommandTests(unittest.TestCase):

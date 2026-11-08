@@ -31,6 +31,8 @@ INTENT_SYSTEM = (
     "rewrite：把主人的意思写成一句完整、不依赖上下文的话：补全「这个」「刚才」「它」指的内容；语音识别常把数字和英文听错"
     "（SH 是 SSH，「一零点零点零点幺五」是 10.0.0.15，depsek 是 DeepSeek），按最合理的意思改正；"
     "ask_teacher 时写成要问老师的完整问题；[密码已隐藏] 原样保留，不要改写或猜测密码。\n"
+    "rewrite 只做这两件事（补全指代、改正识别错字），不添油加醋：主人没说的机器、地址、步骤、要求、验收标准一样都不要加；"
+    "拿不准「刚才那个」「它」指什么，就保留主人的原话，让星期一去问。\n"
     '只输出 JSON：{"intent": "task|knowledge|ask_teacher|chat|unclear", "rewrite": "...", "why": "一句话"}'
 )
 _ASK_TEACHER = re.compile(r"(?i)问(问|一下)?(你的?|一下)?(老师|deep\s*seek|deepseek|depsek|dipsik)|去问|查一下资料")
@@ -79,6 +81,29 @@ def classify(teacher, text: str, recent: list[dict], hosts: list[str] | None = N
     if kind not in KINDS:
         return fallback(text)
     rewrite = str(res.get("rewrite") or "").strip() or text
+    invented = added_hosts(text, ctx, rewrite, hosts or [])
+    if invented:   # "继续在 196 上查刚才那个程序" when 196 was never said: a guess, not his request
+        LOG.warning("[intent] rewrite added %s the owner never said: keeping his words", "、".join(invented))
+        rewrite = text
     if "[密码已隐藏]" in text and "[密码已隐藏]" not in rewrite and "密码" in rewrite:
         rewrite += "（密码已提供）"
     return Intent(kind, rewrite, str(res.get("why") or ""))
+
+
+_CN_DIGIT = {"0": "零〇洞", "1": "一幺", "2": "二两", "3": "三", "4": "四", "5": "五", "6": "六", "7": "七拐", "8": "八", "9": "九勾"}
+
+
+def _said(alias: str, heard: str) -> bool:
+    """Is `alias` in what was heard - as written, or a number read out digit by digit ("196" as "一九六" / "幺九六")?"""
+    if alias.lower() in heard.lower():
+        return True
+    if alias.isdigit():
+        return bool(re.search("".join(f"[{d}{_CN_DIGIT[d]}]" for d in alias), heard))
+    return False
+
+
+def added_hosts(text: str, context: str, rewrite: str, hosts: list[str]) -> list[str]:
+    """Configured machines the rewrite names although neither the owner nor the recent turns did."""
+    aliases = [h.split("（")[0].strip() for h in hosts if h.split("（")[0].strip()]
+    heard = f"{text}\n{context}"
+    return [a for a in aliases if a in rewrite and not _said(a, heard)]

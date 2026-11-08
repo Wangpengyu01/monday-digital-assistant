@@ -59,6 +59,18 @@ class IntentTests(unittest.TestCase):
                       "账号pengyu密码是[密码已隐藏]", RECENT)
         self.assertIn("密码已提供", it.rewrite)
 
+    def test_the_rewrite_adds_nothing_he_did_not_say(self) -> None:
+        hosts = ["196（gp@某台设备）", "backup（ikun@某台设备）"]
+        self.assertIn("不添油加醋", INTENT_SYSTEM)
+        # 2026-11-07 17:45: "继续查刚才那个程序的版本号" came back as "继续在 196 上查…" - 196 was never said
+        it = classify(Teacher({"intent": "task", "rewrite": "继续在 196 上查刚才那个程序的版本号", "why": ""}),
+                      "继续查刚才那个程序的版本号", [{"q": "现在的版本", "a": "直接查程序名加 version 参数", "who": "teacher"}], hosts)
+        self.assertEqual(it.rewrite, "继续查刚才那个程序的版本号")
+        # said by him (written, or read out digit by digit), or in the recent turns: kept
+        for said, recent in (("帮我SH到196看磁盘", []), ("帮我SH到幺九六看磁盘", []), ("再看一下", [{"q": "196 磁盘", "a": "x", "who": "agent"}])):
+            it = classify(Teacher({"intent": "task", "rewrite": "SSH 到 196 看磁盘", "why": ""}), said, recent, hosts)
+            self.assertEqual(it.rewrite, "SSH 到 196 看磁盘", said)
+
     def test_recent_block(self) -> None:
         self.assertIn("星期一（动手）", recent_block(RECENT))
         self.assertEqual(recent_block([]), "")

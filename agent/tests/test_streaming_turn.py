@@ -456,6 +456,38 @@ class StreamingTurnTests(unittest.IsolatedAsyncioTestCase):
             pains = drive.load(Path(tmp) / "run" / "learning")["days"]
             self.assertEqual(next(iter(pains.values()))["pains"][0]["a"], "我是预训练出来的模型")
 
+    def test_an_approval_is_one_sentence_and_one_question(self) -> None:
+        from orchestrator.main import approval_question
+
+        look = {"tool": "ssh", "host": "196", "cmd": "df -h", "purpose": "看磁盘"}
+        self.assertEqual(approval_question(look, "要连接另一台机器", False), "看磁盘，要登录 196 跑 df，行吗？")
+        self.assertEqual(approval_question(look, "要连接另一台机器", False, hint=True),
+                         "看磁盘，要登录 196 跑 df，行吗？嫌我一步步问，就说这次都行。")
+        risky = {"tool": "shell", "cmd": "sudo apt install -y htop", "purpose": "装 htop。"}
+        q = approval_question(risky, "要用 root 权限", True)
+        self.assertEqual(q, "装 htop，要跑 apt，要用 root 权限，我先存好备份再做，行吗？")
+        self.assertEqual((q.count("？"), q.count("。")), (1, 0))
+        q = approval_question({"tool": "shell", "cmd": "ls /etc", "purpose": "看看"}, "涉及系统目录或星期一自己的代码", True)
+        self.assertEqual(q, "看看，要跑 ls，它涉及系统目录或星期一自己的代码，我先存好备份再做，行吗？")
+
+    def test_the_nights_notices_are_one_brief(self) -> None:
+        from orchestrator.main import notice_brief
+
+        one = [("20261108-013500-1-project.txt", "主人，回答慢的问题修好了。我把老师的回答改成边想边说。")]
+        self.assertEqual(notice_brief(one), one[0][1])                       # one is said as it is
+        night = one + [("20261108-020000-2-project.txt", "主人，「不认识自己」我这次没修好：找不到人设在哪。我不服气，下次换个办法再来。"),
+                       ("20261108-021000-3-ask.txt", "主人，我想改一下我自己：权限判断。你说「批准修改」我就上线，说「不用改」就算了。")]
+        b = notice_brief(night)
+        self.assertTrue(b.startswith("主人，有两件事：回答慢的问题修好了；「不认识自己」我这次没修好：找不到人设在哪。"))
+        self.assertNotIn("边想边说", b)                                     # details stay on the page
+        self.assertTrue(b.endswith("另外，我想改一下我自己：权限判断。你说「批准修改」我就上线，说「不用改」就算了。"))
+        self.assertEqual(notice_brief([]), "")
+
+    def test_the_hint_is_once_a_day(self) -> None:
+        orch = object.__new__(Orchestrator)
+        self.assertTrue(orch._approval_hint_due())
+        self.assertFalse(orch._approval_hint_due())
+
     def test_notices_wait_out_the_night_unless_the_owner_is_up(self) -> None:
         import datetime
         import os

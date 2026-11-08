@@ -87,6 +87,9 @@ class DriveTests(unittest.TestCase):
             d["grudges"][0]["last_try"] = "2000-01-01"
             drive.save(d, self.dir)
         self.assertEqual(drive.due_grudges(self.dir), [])                        # tried 3 times: she asks for help
+        self.assertEqual([g["title"] for g in drive.needs_help(self.dir)], ["x"])   # on the 等你处理 list...
+        self.assertTrue(drive.mark_seen("x", self.dir))
+        self.assertEqual(drive.needs_help(self.dir), [])                           # ...until he has seen it
 
     def test_she_rethinks_her_ambition_weekly_within_the_owners_rules(self) -> None:
         drive.feel("又错了", {"q": "q", "a": "a"}, self.dir)

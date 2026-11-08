@@ -266,6 +266,11 @@ body.lite .glass, body.lite header, body.lite .panel, body.lite .toast { backdro
 
     <!-- center: reactor + conversation -->
     <section class="core">
+      <!-- 等你处理: only what needs the owner; nothing at all when all is well -->
+      <div class="panel" id="attn" style="display:none;margin-bottom:10px">
+        <div class="ptitle"><span>等你处理</span><span id="attnCount"></span></div>
+        <div id="attnList"></div>
+      </div>
       <div class="reactor-wrap">
         <div class="side-tick l glass">状态<br><b id="modeText">待机</b><br><br>声音<br><b id="voiceText">—</b></div>
         <canvas id="reactor"></canvas>
@@ -860,6 +865,37 @@ async function answerProposal(yes, btn) {
 }
 $("pjApprove").onclick = (e) => answerProposal(true, e.currentTarget);
 $("pjReject").onclick = (e) => answerProposal(false, e.currentTarget);
+// 等你处理 (/api/attention): a change of herself waiting for a yes, a problem she gave up on
+async function loadAttention() {
+  try {
+    const d = await api("/api/attention"), items = d.items || [], box = $("attn");
+    box.style.display = items.length ? "" : "none";
+    $("attnCount").textContent = items.length ? `${items.length} 件` : "";
+    const list = $("attnList"); list.textContent = "";
+    for (const it of items) {
+      const row = el("div", "item");
+      row.append(el("div", null, it.text));
+      const btns = el("div", "row"); btns.style.gap = "8px"; btns.style.marginTop = "6px";
+      for (const [action, label] of it.actions) {
+        const b = el("button", "btn sm", label);
+        b.onclick = async () => {
+          if (action === "view") { document.querySelector('[data-v="school"]').click(); setTimeout(() => $("pjProposal").scrollIntoView({ block: "center" }), 600); return; }
+          b.disabled = true;
+          try {
+            const r = await fetch("/api/attention/act", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: it.key, action }) });
+            const res = await r.json().catch(() => ({}));
+            toast(res.say || res.error || "好");
+          } catch (err) { toast(err.message); }
+          loadAttention();
+        };
+        btns.append(b);
+      }
+      row.append(btns);
+      list.append(row);
+    }
+  } catch (err) { /* the page works without it */ }
+}
+loadAttention(); setInterval(loadAttention, 15000);
 // 陪练 (learning/spar.py): start / stop, and how it is going right now
 async function loadSpar() {
   try {

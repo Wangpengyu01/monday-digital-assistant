@@ -161,6 +161,21 @@ def due_grudges(learning_dir: Path = LEARNING, today: str | None = None) -> list
     return [g for g in load(learning_dir)["grudges"] if g["tries"] < MAX_TRIES and g.get("last_try", "") < today]
 
 
+def needs_help(learning_dir: Path = LEARNING) -> list[dict]:
+    """Grudges she has given up on by herself (MAX_TRIES) that the owner has not seen yet: they need him."""
+    return [g for g in load(learning_dir)["grudges"] if g["tries"] >= MAX_TRIES and not g.get("seen")]
+
+
+def mark_seen(title: str, learning_dir: Path = LEARNING) -> bool:
+    d = load(learning_dir)
+    g = next((x for x in d["grudges"] if x["title"] == title), None)
+    if g is None:
+        return False
+    g["seen"] = True
+    save(d, learning_dir)
+    return True
+
+
 def set_focus(title: str, learning_dir: Path = LEARNING) -> None:
     d = load(learning_dir)
     d["focus"] = title[:60]

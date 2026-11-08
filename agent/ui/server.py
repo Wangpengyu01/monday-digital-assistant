@@ -368,6 +368,36 @@ def projects_info() -> dict[str, Any]:
     return out
 
 
+def attention_info() -> dict[str, Any]:
+    """等你处理: only what needs the owner - a change of herself waiting for his yes, a problem she gave up
+    on after three tries. Empty when all is well (the page then shows nothing). Approvals of a running task
+    already pop up on their own."""
+    project = _project_mod()
+    from learning import drive
+    items: list[dict[str, Any]] = []
+    waiting = project.pending_proposal()
+    if waiting:
+        prop = project.load_proposal(project.projbox.project_dir(waiting["slug"]))
+        items.append({"key": f"proposal:{waiting['slug']}", "kind": "proposal",
+                      "text": f"她想改自己：{waiting['goal'].replace('修好自己：', '')[:40]}。{prop.get('say', '')[:80]}",
+                      "actions": [["yes", "批准修改"], ["no", "不用改"], ["view", "看改动"]]})
+    for g in drive.needs_help():
+        items.append({"key": f"help:{g['title']}", "kind": "help",
+                      "text": f"她试了 {g['tries']} 次还是没修好：{g['title'][:40]}。{g.get('why', '')[:80]}",
+                      "actions": [["seen", "知道了"]]})
+    return {"items": items}
+
+
+def attention_act(key: str, action: str) -> dict[str, Any]:
+    if key.startswith("proposal:") and action in ("yes", "no"):
+        return answer_proposal(key.split(":", 1)[1], action == "yes")
+    if key.startswith("help:") and action == "seen":
+        _project_mod()
+        from learning import drive
+        return {"ok": drive.mark_seen(key.split(":", 1)[1]), "say": "好，记下你看过了"}
+    return {"ok": False, "error": "不认识的操作"}
+
+
 def answer_proposal(slug: str, yes: bool) -> dict[str, Any]:
     """The owner pressed 批准 / 不用改 on the page: same path as saying it."""
     project = _project_mod()
@@ -645,6 +675,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             "/api/school": lambda: self._json(school_info()),
             "/api/projects": lambda: self._json(projects_info()),
             "/api/spar": lambda: self._json(spar_info()),
+            "/api/attention": lambda: self._json(attention_info()),
             "/api/progress": lambda: self._json(progress_info()),
             "/api/owner": lambda: self._json(owner_info()),
             "/api/files": lambda: self._json(list_dir(qs.get("root", "files"), qs.get("path", ""))),
@@ -676,6 +707,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 res = start_project(str(self._body_json().get("goal") or ""))
                 self._json(res, 200 if res.get("ok") else 409)
             self._guard(run_project)
+        elif u.path == "/api/attention/act":
+            def run_attention() -> None:
+                b = self._body_json()
+                res = attention_act(str(b.get("key") or ""), str(b.get("action") or ""))
+                self._json(res, 200 if res.get("ok") else 409)
+            self._guard(run_attention)
         elif u.path in ("/api/spar/start", "/api/spar/stop"):
             def run_spar() -> None:
                 res = start_spar() if u.path.endswith("start") else stop_spar()

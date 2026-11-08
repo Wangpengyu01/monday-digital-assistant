@@ -172,6 +172,48 @@ def _spoken_step(step: dict) -> str:
     return f"登录 {step.get('host')} 跑 {prog}" if tool == "ssh" else f"跑 {prog}"
 
 
+def notice_brief(items: list[tuple[str, str]]) -> str:
+    """Queued notices (file name, text) -> what to say. One is said as it is. Several become one brief: the
+    first sentence of each, then the ones that need an answer (…-ask.txt) in full - she speaks when the owner
+    can use a result or has to act, and the details are on the page."""
+    infos = [t for n, t in items if t and not n.endswith("-ask.txt")]
+    asks = [t for n, t in items if t and n.endswith("-ask.txt")]
+    if len(infos) + len(asks) <= 1:
+        return (infos or asks or [""])[0]
+    heads = []
+    for t in infos:
+        t = re.sub(r"^主人[，,]\s*", "", t)
+        first = re.split(r"(?<=[。！？!?])", t, maxsplit=1)[0].rstrip("。！？!? ")
+        heads.append(first[:70])
+    from learning.selfstatus import count
+    parts = []
+    if len(heads) > 1:
+        parts.append(f"主人，有{count(len(heads))}件事：" + "；".join(heads) + "。")
+    elif heads:
+        parts.append(f"主人，{heads[0]}。")
+    for a in asks:   # needs his answer: in full, last, so the question is what he hears at the end
+        parts.append(("另外，" if parts else "主人，") + re.sub(r"^主人[，,]\s*", "", a))
+    return "".join(parts)
+
+
+_RISK_SHORT = re.compile(r"^(会|要)")
+
+
+def approval_question(step: dict, why: str, danger: bool, *, hint: bool = False) -> str:
+    """The spoken approval: one sentence, one question. A danger step says why in a few words and that a
+    backup comes first (no second sentence about the backup afterwards). hint: once a day, the way to stop
+    being asked step by step (ask-level only: danger steps are asked every time anyway)."""
+    purpose = re.sub(r"[。.！!？?，,\s]+$", "", str(step.get("purpose") or ""))[:24]
+    what = _spoken_step(step)
+    head = f"{purpose}，要{what}" if purpose else f"要{what}"
+    if danger:
+        reason = re.sub(r"[（(].*?[）)]", "", why or "").strip("，。 ")[:20]
+        reason = reason if _RISK_SHORT.match(reason) or not reason else f"它{reason}"
+        backup = "，我先存好备份再做" if step.get("tool") == "shell" else ""
+        return f"{head}，{reason or '有风险'}{backup}，行吗？"
+    return f"{head}，行吗？" + ("嫌我一步步问，就说这次都行。" if hint else "")
+
+
 class Orchestrator:
     camera_enabled: bool = False
     camera_url: str = "http://10.0.0.159:8080/shot.jpg"
@@ -568,11 +610,14 @@ class Orchestrator:
                     continue
             except OSError:
                 continue
-            try:
-                text = files[0].read_text(encoding="utf-8").strip()
-                files[0].unlink()
-            except OSError:
-                continue
+            items = []
+            for f in files[:12]:   # all that waited (the night's work): one brief, not one announcement each
+                try:
+                    items.append((f.name, f.read_text(encoding="utf-8").strip()))
+                    f.unlink()
+                except OSError:
+                    continue
+            text = notice_brief(items)
             if not text:
                 continue
             LOG.info("[notice] %s", text[:120])
@@ -2593,6 +2638,14 @@ class Orchestrator:
         if generation == self._active_turn_id and not self._turn_busy:
             self.set_state(AgentState.LISTEN)
 
+    def _approval_hint_due(self) -> bool:
+        """The "这次都行" hint is spoken with the first ask-level question of a day, not of every task."""
+        today = time.strftime("%Y-%m-%d")
+        if getattr(self, "_approval_hint_day", "") == today:
+            return False
+        self._approval_hint_day = today
+        return True
+
     async def _agent_approve(self, step: dict, why: str, risk: str = "ask") -> str:
         """Ask the owner (voice + web page) before a step that is not known read-only; no answer = no.
         -> "once" | "always" (remember: ask-level only) | "deny". Danger-level steps are asked every time."""
@@ -2604,20 +2657,10 @@ class Orchestrator:
         LOG.info("[agent] approval %s: %s (%s, %s)", aid, action, risk, why)
         await self.emit({"type": "agent_confirm", "id": aid, "action": action, "why": why, "risk": risk,
                          "rememberable": not danger, "purpose": str(step.get("purpose") or "")})
-        # short spoken question (a task may ask several times); the full command is on the web page
-        first_ask = not getattr(self, "_agent_asked", False)  # "这次都行" not explained yet in this task
-        purpose = re.sub(r"[。.！!？?，,\s]+$", "", str(step.get("purpose") or ""))
-        what = _spoken_step(step)
-        head = f"{purpose}，要{what}" if purpose else f"要{what}"
+        # one sentence, one question (the owner's attention is what this costs); the full command, the reason
+        # and the answer buttons are on the web page
         if not fut.done():  # already answered on the web page: don't ask out loud
-            if danger:
-                backup = "我会先存备份，" if step.get("tool") == "shell" else ""
-                await self._agent_say(f"{head}。这步有风险，{why}，{backup}行吗？")
-            elif first_ask:  # explained on the first ask-level question (danger steps can't use it)
-                self._agent_asked = True
-                await self._agent_say(f"{head}，行吗？说确认；说这次都行，这个任务就不再一步步问你。")
-            else:
-                await self._agent_say(f"{head}，行吗？")
+            await self._agent_say(approval_question(step, why, danger, hint=not danger and self._approval_hint_due()))
         try:
             answer = str(await asyncio.wait_for(fut, timeout=self.agent_approval_timeout))
         except asyncio.TimeoutError:
@@ -2643,7 +2686,7 @@ class Orchestrator:
                       grants=getattr(self, "grants", None), log_training=lambda q, a: self.learner.log_training(q, a, system=self._system_body()))
         await self.emit({"type": "agent_start", "task": task})
         self._agent_task_text = task  # "你在忙什么" mentions it (learning/selfstatus.py)
-        self._agent_asked = False  # the first question of a task explains "这次都行"
+        self._agent_asked = False  # (kept for older callers; the "这次都行" hint is now once a day)
         self._mark_activity()
         self._agent_running = True
         try:

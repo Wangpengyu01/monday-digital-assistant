@@ -447,9 +447,9 @@ def main() -> None:
         drive.rewrite_ambition(rt.teacher, rt.learning_dir)   # once a week she rethinks who she wants to become
     rec = review(rt.teacher, learning_dir=rt.learning_dir, start=not a.dry_run, hours=a.hours)
     print(json.dumps(rec, ensure_ascii=False, indent=1))
-    if rec["started"]:
-        project.notify(started_notice(rec))
-    elif not a.dry_run and rec["skipped"] not in ("最近没发现问题",):
+    # nothing is said when she starts: only the result is worth the owner's attention (the repair's own
+    # notice, in the morning brief); what she started shows on the page
+    if not rec["started"] and not a.dry_run and rec["skipped"] not in ("最近没发现问题",):
         LOG.info("no repair started: %s", rec["skipped"])
 
 

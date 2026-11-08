@@ -606,9 +606,10 @@ class Agent:
                 LOG.warning("[agent] snapshot before danger step failed: %s", exc)
                 return "blocked", -1, f"执行前没能存好备份节点（{exc}），为了安全这一步不做"
             LOG.info("[agent] snapshot %s before: %s", sid, describe_step(step))
-            if self.progress:  # the id goes to the page; read aloud it was a string of digits
+            # not said aloud: the approval question already told the owner a backup comes first (his
+            # attention is the cost); the id goes to the page
+            if self.progress:
                 await self.progress({"purpose": "执行前存备份节点", "action": f"备份节点 {sid}", "code": 0, "output": sid})
-            await self.say("我先存了一个备份节点，万一出问题可以回退。")
         if step.get("tool") == "mcp":
             if self.mcp is None:
                 code, out = 127, "没有配置 MCP 服务"
